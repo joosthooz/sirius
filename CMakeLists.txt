@@ -49,6 +49,15 @@ else()
   message(FATAL_ERROR "LIBCUDF_ENV_PREFIX environment variable is not set.")
 endif()
 
+# Workaround for the legacy use of find_package(CUDA) in Torch's component Caffe
+set(CUDA_TOOLKIT_ROOT_DIR "${CONDA_PREFIX}/targets/x86_64-linux")
+set(CUDA_INCLUDE_DIRS "${CUDA_TOOLKIT_ROOT_DIR}/include")
+
+# Find libtorch
+set(CMAKE_PREFIX_PATH "/home/jhoozemans/workspace/sirius/libtorch/libtorch/share/cmake/Torch")
+find_package(Torch REQUIRED)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+
 # Set CUDA architecture and flags
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
@@ -120,6 +129,7 @@ include_directories(src/include/cudf)
 include_directories(${CONDA_PREFIX}/include)
 include_directories(${CONDA_PREFIX}/include/cudf)
 include_directories(${CONDA_PREFIX}/include/rmm)
+include_directories(${TORCH_INCLUDE_DIRS})
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -142,9 +152,9 @@ set_target_properties(${LOADABLE_EXTENSION_NAME}
                       PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 target_link_libraries(${EXTENSION_NAME} substrait_extension cudf::cudf rmm::rmm
-                      ${NUMA_LIB})
+                      ${NUMA_LIB} ${TORCH_LIBRARIES})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension cudf::cudf
-                      rmm::rmm)
+                      rmm::rmm ${TORCH_LIBRARIES})
 
 # Third-party
 set(DEPS_PREFIX "_deps")

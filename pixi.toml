@@ -17,9 +17,11 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
 
 [dependencies]
 cmake = "4.1.*"
+cuda = "13.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
 cuda-version = "13.*"
+cuda-toolkit = "13.*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
