@@ -22,6 +22,12 @@
 #include "gpu_physical_operator.hpp"
 #include "gpu_query_result.hpp"
 
+// cucascade
+#include <data/data_batch.hpp>
+
+// standard library
+#include <memory>
+
 namespace duckdb {
 
 class GPUPreparedStatementData;
@@ -85,6 +91,10 @@ class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
   static size_t FinalMaterialize(GPUIntermediateRelation input_relation,
                                  GPUIntermediateRelation& output_relation,
                                  size_t col);
+
+    // Placeholder for now...
+  SinkResultType convert_batch_to_duckdb_collection(
+    std::shared_ptr<cucascade::data_batch> input_batch) const;
 };
 
 }  // namespace duckdb

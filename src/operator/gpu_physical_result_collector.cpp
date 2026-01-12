@@ -15,7 +15,9 @@
  */
 
 #include "operator/gpu_physical_result_collector.hpp"
+#include <operator/result/host_table_chunk_reader.hpp>
 
+#include "data/sirius_converter_registry.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
@@ -26,7 +28,15 @@
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "memory/sirius_memory_manager.hpp"
 #include "utils.hpp"
+
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+
+// cucascade
+#include <data/cpu_data_representation.hpp>
+#include <memory/common.hpp>
 
 namespace duckdb {
 
@@ -515,5 +525,82 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
 // bool PhysicalMaterializedCollector::SinkOrderDependent() const {
 // 	return true;
 // }
+
+//===----------------------------------------------------------------------===//
+// Data batch APIs
+//===----------------------------------------------------------------------===//
+SinkResultType GPUPhysicalMaterializedCollector::convert_batch_to_duckdb_collection(
+  std::shared_ptr<cucascade::data_batch> input_batch) const
+{
+  if (!input_batch) {
+    throw InvalidInputException("[GPUPhysicalMaterializedCollector] input_batch is null");
+  }
+  if (!result_collection) {
+    throw InvalidInputException("[GPUPhysicalMaterializedCollector] result_collection is null");
+  }
+
+  auto* data = input_batch->get_data();
+  if (!data) {
+    throw InvalidInputException(
+      "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+  }
+
+  // If data is in GPU tier, convert to HOST tier first
+  if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
+    if (!::sirius::memory_manager::is_initialized()) {
+      throw InternalException(
+        "[GPUPhysicalMaterializedCollector] memory_manager is not initialized");
+    }
+    if (::sirius::converter_registry::is_initialized()) {
+      ::sirius::converter_registry::initialize();
+    }
+
+    // Make the memory reservation for host memory
+    auto& memory_mgr = ::sirius::memory_manager::get();
+    auto reservation = memory_mgr.request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+      data->get_size_in_bytes());
+    if (!reservation) {
+      throw InternalException(
+        "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
+    }
+
+    // Get the memory space for host tier
+    auto mem_space = memory_mgr.get_memory_space(reservation->tier(), reservation->device_id());
+    if (!mem_space) {
+      throw InternalException(
+        "[GPUPhysicalMaterializedCollector] Invalid reservation memory_space for HOST tier");
+    }
+
+    // Convert to host representation
+    auto& registry = ::sirius::converter_registry::get();
+    input_batch->convert_to<cucascade::host_table_representation>(
+      registry, mem_space, rmm::cuda_stream_default);
+
+    data = input_batch->get_data();
+    if (!data) {
+      throw InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+    }
+  } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
+    // Data must be in HOST tier
+    throw InvalidInputException(
+      "[GPUPhysicalMaterializedCollector] Expected host_table_representation in HOST tier");
+  }
+
+  auto const& host_table = data->cast<cucascade::host_table_representation>();
+  ::sirius::op::result::host_table_chunk_reader chunk_reader(host_table, types);
+  auto const num_chunks = chunk_reader.calculate_num_chunks();
+  result_collection->SetCapacity(num_chunks);
+  for(size_t i = 0; i < num_chunks; i++) {
+    duckdb::DataChunk chunk;
+    if (!chunk_reader.get_next_chunk(chunk)) {
+      break;
+    }
+    result_collection->AddChunk(chunk);
+  }
+
+  return SinkResultType::FINISHED;
+}
 
 }  // namespace duckdb
