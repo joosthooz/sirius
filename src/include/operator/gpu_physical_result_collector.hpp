@@ -92,7 +92,7 @@ class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
                                  GPUIntermediateRelation& output_relation,
                                  size_t col);
 
-    // Placeholder for now...
+  // Placeholder for now...
   SinkResultType convert_batch_to_duckdb_collection(
     std::shared_ptr<cucascade::data_batch> input_batch) const;
 };

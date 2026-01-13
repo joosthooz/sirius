@@ -15,7 +15,6 @@
  */
 
 #include "operator/gpu_physical_result_collector.hpp"
-#include <operator/result/host_table_chunk_reader.hpp>
 
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/main/config.hpp"
@@ -30,6 +29,8 @@
 #include "log/logging.hpp"
 #include "memory/sirius_memory_manager.hpp"
 #include "utils.hpp"
+
+#include <operator/result/host_table_chunk_reader.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
@@ -592,11 +593,9 @@ SinkResultType GPUPhysicalMaterializedCollector::convert_batch_to_duckdb_collect
   ::sirius::op::result::host_table_chunk_reader chunk_reader(host_table, types);
   auto const num_chunks = chunk_reader.calculate_num_chunks();
   result_collection->SetCapacity(num_chunks);
-  for(size_t i = 0; i < num_chunks; i++) {
+  for (size_t i = 0; i < num_chunks; i++) {
     duckdb::DataChunk chunk;
-    if (!chunk_reader.get_next_chunk(chunk)) {
-      break;
-    }
+    if (!chunk_reader.get_next_chunk(chunk)) { break; }
     result_collection->AddChunk(chunk);
   }
 

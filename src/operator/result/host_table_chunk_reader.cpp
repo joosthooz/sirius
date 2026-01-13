@@ -231,7 +231,7 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
     return false;
   }
 
-  // Intialize the chunk
+  // Initialize the chunk
   auto const remaining = total_rows - row_offset;
   auto const count     = std::min(remaining, static_cast<size_t>(STANDARD_VECTOR_SIZE));
   /// TODO: pass in client context allocator?

@@ -18,7 +18,7 @@
 
 /**
  * NOTE:
- * This file provides utilities for working with cudf metatdata.
+ * This file provides utilities for working with cudf metadata.
  * See cudf::pack() and cudf::detail::unpack() for reference.
  * See https://github.com/rapidsai/cudf/issues/20966 for a feature request to make similar
  * functionality available via cudf itself.

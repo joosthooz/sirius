@@ -419,10 +419,9 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
                      cudaMemcpyHostToDevice);
         } else {
           std::vector<cudf::size_type> offsets32(h_offsets.size(), 0);
-          std::transform(h_offsets.begin(),
-                         h_offsets.end(),
-                         offsets32.begin(),
-                         [](int64_t value) { return static_cast<cudf::size_type>(value); });
+          std::transform(h_offsets.begin(), h_offsets.end(), offsets32.begin(), [](int64_t value) {
+            return static_cast<cudf::size_type>(value);
+          });
           offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                                   h_offsets.size(),
                                                   cudf::mask_state::UNALLOCATED,
