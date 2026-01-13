@@ -17,12 +17,16 @@
 #include "catch.hpp"
 
 // sirius
-#include <memory/fixed_size_host_memory_resource.hpp>
-#include <memory/memory_reservation_manager.hpp>
-#include <memory/numa_region_pinned_host_allocator.hpp>
-#include <scan/duckdb_scan_task.hpp>
+#include "memory/multiple_blocks_allocation_accessor.hpp"
 
-using namespace sirius::op::scan;
+#include <memory/fixed_size_host_memory_resource.hpp>
+#include <memory/numa_region_pinned_host_allocator.hpp>
+
+// standard library
+#include <memory>
+#include <vector>
+
+using namespace sirius::memory;
 using namespace cucascade::memory;
 
 // Standalone memory resource for testing with custom block size

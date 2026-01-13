@@ -15,6 +15,7 @@
 # =============================================================================
 
 add_subdirectory(scan)
+add_subdirectory(result)
 
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}

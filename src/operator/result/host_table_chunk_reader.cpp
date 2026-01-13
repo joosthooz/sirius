@@ -15,11 +15,12 @@
  */
 
 // sirius
-#include "duckdb/common/vector_size.hpp"
-
 #include <helper/utils.hpp>
 #include <memory/host_table_utils.hpp>
 #include <result/host_table_chunk_reader.hpp>
+
+// duckdb
+#include <duckdb/common/vector_size.hpp>
 
 // standard library
 #include <algorithm>
@@ -31,9 +32,6 @@ namespace sirius::op::result {
 host_table_chunk_reader::column_reader::column_reader(
   metadata_node const& node, std::unique_ptr<multiple_blocks_allocation> const& allocation)
 {
-  if (node.size < 0) {
-    throw std::runtime_error("[host_table_chunk_reader::column_reader] Negative column size.");
-  }
   size       = static_cast<size_t>(node.size);
   null_count = static_cast<size_t>(node.null_count);
   if (node.null_mask_offset < 0) { null_count = 0; }
@@ -45,7 +43,6 @@ host_table_chunk_reader::column_reader::column_reader(
   }
 
   if (node.type.id() == cudf::type_id::STRING) {
-    // For STRING type, there is a child node for offse
     if (node.children.size() != 1) {
       throw std::runtime_error(
         "[host_table_chunk_reader::column_reader::initialize_accessors] STRING type must have one "
@@ -87,6 +84,8 @@ void host_table_chunk_reader::column_reader::copy_mask_to_validity(
   }
 
   // Unaligned case (shouldn't happen)
+  SIRIUS_LOG_DEBUG(
+    "[host_table_chunk_reader::column_reader::copy_mask_to_validity] Unaligned mask copy");
   uint8_t byte = mask_accessor.get_current(allocation);
   byte >>= bit_shift;
   for (size_t i = 0; i < count; ++i) {
@@ -140,38 +139,56 @@ void host_table_chunk_reader::column_reader::copy_string(
   // We are copying into a flat vector
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 
-  auto* dest_ptr                     = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
-  duckdb::ValidityMask* validity_ptr = nullptr;
+  auto* dest_ptr = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
+
+  // NULL case
   if (null_count != 0) {
     auto& validity = duckdb::FlatVector::Validity(vector);
     copy_mask_to_validity(validity, row_offset, count, allocation);
-    validity_ptr = &validity;
+
+    // Get the current offset
+    auto start = offset_accessor.get_current(allocation);
+
+    // Copy each string individually
+    for (size_t i = 0; i < count; ++i) {
+      offset_accessor.advance();
+      auto end = offset_accessor.get_current(allocation);
+
+      assert(start > 0 && end >= start);
+
+      if (!validity.RowIsValid(i)) {
+        dest_ptr[i] = duckdb::string_t(nullptr, 0);
+        start       = end;
+        continue;
+      }
+
+      auto const len = static_cast<size_t>(end - start);
+      auto str       = duckdb::StringVector::EmptyString(vector, len);
+      if (len > 0) {
+        // We may have skipped some data due to nulls, so we need to set the cursor
+        data_accessor.set_cursor(data_accessor.initial_byte_offset + static_cast<size_t>(start));
+        data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len);
+      }
+      str.Finalize();
+      dest_ptr[i] = str;
+      start       = end;
+    }
+    return;
   }
 
-  // Get initial offset
-  int64_t start = offset_accessor.get_current(allocation);
-  offset_accessor.advance();
+  // NO NULLS case (fast path)
+  auto start = offset_accessor.get_current(allocation);
 
-  // Copy each string individually
+  // Each string must be copied individually, as some strings may be inlined into duckdb::string_t
   for (size_t i = 0; i < count; ++i) {
-    int64_t end = offset_accessor.get_current(allocation);
     offset_accessor.advance();
+    auto end = offset_accessor.get_current(allocation);
 
-    assert(end >= start);
-
-    bool is_valid = (validity_ptr == nullptr) || validity_ptr->RowIsValid(i);
-    if (!is_valid) {
-      dest_ptr[i] = duckdb::string_t(nullptr, 0);
-      start       = end;
-      continue;
-    }
+    assert(start > 0 && end >= start);
 
     auto const len = static_cast<size_t>(end - start);
     auto str       = duckdb::StringVector::EmptyString(vector, len);
-    if (len > 0) {
-      data_accessor.set_cursor(data_accessor.initial_byte_offset + static_cast<size_t>(start));
-      data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len);
-    }
+    if (len > 0) { data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len); }
     str.Finalize();
     dest_ptr[i] = str;
     start       = end;
@@ -195,6 +212,9 @@ host_table_chunk_reader::host_table_chunk_reader(
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
     if (col_idx == 0) {
       total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);
+      if (total_rows < 0) {
+        throw std::runtime_error("[host_table_chunk_reader] Negative total rows in first column.");
+      }
     } else if (metadata_nodes[col_idx].size != total_rows) {
       throw std::runtime_error(
         "[host_table_chunk_reader] Metadata column size mismatch across columns.");
