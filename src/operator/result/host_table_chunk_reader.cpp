@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "duckdb/common/types.hpp"
+
 #include <helper/utils.hpp>
 #include <memory/host_table_utils.hpp>
 #include <result/host_table_chunk_reader.hpp>
@@ -113,11 +115,9 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 
   // Do the data copy
-  /// TODO: handle HUGEINT case
   auto const type_size =
     static_cast<size_t>(duckdb::GetTypeIdSize(vector.GetType().InternalType()));
   auto* dest_ptr = duckdb::FlatVector::GetData<uint8_t>(vector);
-  data_accessor.set_cursor(data_accessor.initial_byte_offset + row_offset * type_size);
   data_accessor.memcpy_to(allocation, dest_ptr, count * type_size);
 
   // Do the validity mask copy, if necessary
@@ -218,6 +218,12 @@ host_table_chunk_reader::host_table_chunk_reader(
     } else if (metadata_nodes[col_idx].size != total_rows) {
       throw std::runtime_error(
         "[host_table_chunk_reader] Metadata column size mismatch across columns.");
+    }
+
+    // For the time being, we do not handle HUGEINT, as cudf does not support it
+    if (types[col_idx] == duckdb::LogicalType::HUGEINT) {
+      throw std::runtime_error(
+        "[host_table_chunk_reader] HUGEINT type is not currently supported.");
     }
 
     column_readers.emplace_back(metadata_nodes[col_idx], allocation);

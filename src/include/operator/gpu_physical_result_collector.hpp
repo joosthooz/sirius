@@ -92,9 +92,17 @@ class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
                                  GPUIntermediateRelation& output_relation,
                                  size_t col);
 
-  // Placeholder for now...
-  SinkResultType convert_batch_to_duckdb_collection(
-    std::shared_ptr<cucascade::data_batch> input_batch) const;
+  /**
+   * @brief Sink a data batch into the result collection
+   *
+   * @param[in] input_batch The input data batch
+   * @return SinkResultType The result of the sink operation (currently, only FINISHED is returned)
+   * @throws InvalidInputException if input_batch or result_collection is null, if the data_batch
+   * has no data, or if data currently resides in the DISK tier
+   * @throws InternalException if the memory manager is not initialized, if the reservation fails,
+   * or if the memory space for the reservation is invalid
+   */
+  SinkResultType sink(std::shared_ptr<cucascade::data_batch> input_batch) const;
 };
 
 }  // namespace duckdb

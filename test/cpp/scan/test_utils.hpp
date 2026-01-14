@@ -19,14 +19,17 @@
 // sirius
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
-#include <memory/reservation_manager_configurator.hpp>
 #include <memory/sirius_memory_manager.hpp>
+
+// cucascade
+#include <memory/reservation_manager_configurator.hpp>
 
 // standard library
 #include <vector>
 
 // rmm
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
+#include <rmm/mr/device/per_device_resource.hpp>
 
 using namespace cucascade::memory;
 
@@ -63,6 +66,14 @@ inline void initialize_memory_manager()
 
     // Initialize the converter registry for representation conversions
     sirius::converter_registry::initialize();
+
+    // Ensure cudf uses the same device resource as the memory manager.
+    auto* gpu_space = sirius::memory_manager::get().get_memory_space(Tier::GPU, 0);
+    if (gpu_space) {
+      auto* allocator = gpu_space->get_default_allocator();
+      rmm::mr::set_current_device_resource(allocator);
+      rmm::mr::set_current_device_resource_ref(rmm::device_async_resource_ref{*allocator});
+    }
 
     initialized = true;
   }

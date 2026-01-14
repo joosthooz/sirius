@@ -527,12 +527,11 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
 // 	return true;
 // }
 
-//===----------------------------------------------------------------------===//
-// Data batch APIs
-//===----------------------------------------------------------------------===//
-SinkResultType GPUPhysicalMaterializedCollector::convert_batch_to_duckdb_collection(
+SinkResultType GPUPhysicalMaterializedCollector::sink(
   std::shared_ptr<cucascade::data_batch> input_batch) const
 {
+  using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
+
   if (!input_batch) {
     throw InvalidInputException("[GPUPhysicalMaterializedCollector] input_batch is null");
   }
@@ -589,8 +588,13 @@ SinkResultType GPUPhysicalMaterializedCollector::convert_batch_to_duckdb_collect
       "[GPUPhysicalMaterializedCollector] Expected host_table_representation in HOST tier");
   }
 
+  // Get host table representation
   auto const& host_table = data->cast<cucascade::host_table_representation>();
-  ::sirius::op::result::host_table_chunk_reader chunk_reader(host_table, types);
+
+  // Initialize chunk reader
+  host_table_chunk_reader chunk_reader(host_table, types);
+
+  // Push chunks to result collection
   auto const num_chunks = chunk_reader.calculate_num_chunks();
   result_collection->SetCapacity(num_chunks);
   for (size_t i = 0; i < num_chunks; i++) {
