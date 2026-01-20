@@ -151,15 +151,18 @@ namespace detail {
 /**
  * @brief Local copy of cudf::detail::serialized_column for metadata parsing.
  *
- * This struct mirrors the layout of the serialized metadata used by cudf::pack().
+ * This struct is a copy of cudf::used by cudf::pack(). See
+ * https://github.com/rapidsai/cudf/blob/d63d978bf949e278a650a829b85c0744e52d60b0/cpp/src/copying/pack.cpp#L31
  */
 struct serialized_column {
   cudf::data_type type;
   cudf::size_type size;
   cudf::size_type null_count;
-  int64_t data_offset;
-  int64_t null_mask_offset;
+  int64_t data_offset;       // offset into contiguous data buffer, or -1 if column data is null
+  int64_t null_mask_offset;  // offset into contiguous data buffer, or -1 if column data is null
   cudf::size_type num_children;
+  // Explicitly pad to avoid uninitialized padding bits, allowing `serialized_column` to be bit-wise
+  // comparable
   int pad{};
 };
 

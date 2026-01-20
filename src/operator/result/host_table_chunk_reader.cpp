@@ -60,46 +60,15 @@ void host_table_chunk_reader::column_reader::copy_mask_to_validity(
   size_t count,
   std::unique_ptr<multiple_blocks_allocation> const& allocation)
 {
-  if (count == 0) {
-    validity.Reset(0);
-    return;
-  }
+  assert(row_offset + count <= static_cast<size_t>(size));
+  assert(utils::mod_8(row_offset) == 0);  // Must be byte-aligned start
 
   // Initialize validity mask
   validity.Initialize(count);
 
-  // Determine if we are byte-aligned
-  auto const bit_shift = utils::mod_8(row_offset);
-  mask_accessor.set_cursor(mask_accessor.initial_byte_offset + utils::div_8(row_offset));
-  if (bit_shift == 0) {
-    // Aligned case (common case)
-    auto* validity_ptr       = reinterpret_cast<uint8_t*>(validity.GetData());
-    auto const bytes_to_copy = utils::div_8(count);
-    auto const leftover_bits = utils::mod_8(count);
-    mask_accessor.memcpy_to(allocation, validity_ptr, bytes_to_copy);
-    if (leftover_bits > 0) {
-      // Should only be for the last vector in a chunk
-      validity_ptr[bytes_to_copy] =
-        mask_accessor.get_current(allocation) & utils::make_mask<uint8_t>(leftover_bits);
-    }
-    return;
-  }
-
-  // Unaligned case (shouldn't happen)
-  SIRIUS_LOG_DEBUG(
-    "[host_table_chunk_reader::column_reader::copy_mask_to_validity] Unaligned mask copy");
-  uint8_t byte = mask_accessor.get_current(allocation);
-  byte >>= bit_shift;
-  for (size_t i = 0; i < count; ++i) {
-    auto const bit_set = byte & 0x1;
-    if (!bit_set) { validity.SetInvalid(static_cast<duckdb::idx_t>(i)); }
-    if (utils::mod_8(bit_shift + i) == 0) {
-      mask_accessor.advance();
-      byte = mask_accessor.get_current(allocation);
-    } else {
-      byte >>= 1;
-    }
-  }
+  auto* validity_ptr       = reinterpret_cast<uint8_t*>(validity.GetData());
+  auto const bytes_to_copy = utils::ceil_div_8(count);
+  mask_accessor.memcpy_to(allocation, validity_ptr, bytes_to_copy);
 }
 
 void host_table_chunk_reader::column_reader::copy_fixed_width(
@@ -169,7 +138,7 @@ void host_table_chunk_reader::column_reader::copy_string(
         data_accessor.set_cursor(data_accessor.initial_byte_offset + static_cast<size_t>(start));
         data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len);
       }
-      str.Finalize();
+      str.Finalize();  // Inline the string if possible
       dest_ptr[i] = str;
       start       = end;
     }
@@ -189,7 +158,7 @@ void host_table_chunk_reader::column_reader::copy_string(
     auto const len = static_cast<size_t>(end - start);
     auto str       = duckdb::StringVector::EmptyString(vector, len);
     if (len > 0) { data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len); }
-    str.Finalize();
+    str.Finalize();  // Inline the string if possible
     dest_ptr[i] = str;
     start       = end;
   }

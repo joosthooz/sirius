@@ -48,11 +48,12 @@ struct multiple_blocks_allocation_accessor {
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
   //===----------Fields----------===//
-  size_t block_size          = 0;  ///< The size of each block in bytes
-  size_t num_blocks          = 0;  ///< The number of blocks in the allocation
-  size_t block_index         = 0;  ///< The current block index
-  size_t offset_in_block     = 0;  ///< The current byte offset in the block
-  size_t initial_byte_offset = 0;  ///< The initial byte offset set during initialize
+  size_t block_size      = 0;  ///< The size of each block in bytes
+  size_t num_blocks      = 0;  ///< The number of blocks in the allocation
+  size_t block_index     = 0;  ///< The current block index
+  size_t offset_in_block = 0;  ///< The current byte offset in the block
+  size_t initial_byte_offset =
+    0;  ///< The initial byte offset into the allocation set during initialize
 
   /**
    * @brief Initialize the accessor with a byte offset within the allocation.

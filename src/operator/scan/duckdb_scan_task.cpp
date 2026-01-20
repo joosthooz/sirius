@@ -140,7 +140,6 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
       if (tail_bits > 0) {
         auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
         mask_blocks_accessor.set_current(tail_mask, allocation);
-        mask_blocks_accessor.advance();
       }
     } else {
       // Byte unaligned case
@@ -168,7 +167,6 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
       if (tail_bits > 0) {
         auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
         mask_blocks_accessor.set_current(tail_mask, allocation);
-        mask_blocks_accessor.advance();
       }
     }
     return;

@@ -527,6 +527,12 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
 // 	return true;
 // }
 
+/**
+ * @note For now, we assume the input batch, if in the HOST tier, is always in the
+ * host_table_representation, and if the input batch is in the GPU tier, we convert it to the
+ * host_table_representation. In the future, we should register converters for other specialized
+ * data representations and invoke one such here.
+ */
 SinkResultType GPUPhysicalMaterializedCollector::sink(
   std::shared_ptr<cucascade::data_batch> input_batch) const
 {
@@ -556,6 +562,7 @@ SinkResultType GPUPhysicalMaterializedCollector::sink(
     }
 
     // Make the memory reservation for host memory
+    /// TODO: Find the closest memory space, not just any memory space, in HOST tier
     auto& memory_mgr = ::sirius::memory_manager::get();
     auto reservation = memory_mgr.request_reservation(
       cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
@@ -565,17 +572,13 @@ SinkResultType GPUPhysicalMaterializedCollector::sink(
         "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
     }
 
-    // Get the memory space for host tier
-    auto mem_space = memory_mgr.get_memory_space(reservation->tier(), reservation->device_id());
-    if (!mem_space) {
-      throw InternalException(
-        "[GPUPhysicalMaterializedCollector] Invalid reservation memory_space for HOST tier");
-    }
+    // Get the memory space for the reservation
+    auto& mem_space = reservation->get_memory_space();
 
     // Convert to host representation
     auto& registry = ::sirius::converter_registry::get();
     input_batch->convert_to<cucascade::host_table_representation>(
-      registry, mem_space, rmm::cuda_stream_default);
+      registry, &mem_space, rmm::cuda_stream_default);
 
     data = input_batch->get_data();
     if (!data) {
@@ -588,7 +591,8 @@ SinkResultType GPUPhysicalMaterializedCollector::sink(
       "[GPUPhysicalMaterializedCollector] Expected host_table_representation in HOST tier");
   }
 
-  // Get host table representation
+  // Only accepting host_table_representations for now
+  assert(dynamic_cast<cucascade::host_table_representation*>(data) != nullptr);
   auto const& host_table = data->cast<cucascade::host_table_representation>();
 
   // Initialize chunk reader
