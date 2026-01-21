@@ -15,8 +15,6 @@
  */
 
 // sirius
-#include "duckdb/common/types.hpp"
-
 #include <helper/utils.hpp>
 #include <memory/host_table_utils.hpp>
 #include <result/host_table_chunk_reader.hpp>
@@ -108,60 +106,35 @@ void host_table_chunk_reader::column_reader::copy_string(
   // We are copying into a flat vector
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 
-  auto* dest_ptr = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
+  // Allocate duckdb buffer and bulk copy data into it
+  auto const start_offset     = offset_accessor.get_current(allocation);
+  auto const end_offset       = offset_accessor.get(row_offset + count, allocation);
+  auto const total_data_bytes = end_offset - start_offset;
+  auto str_buffer             = duckdb::make_buffer<duckdb::VectorBuffer>(total_data_bytes);
+  auto str_buffer_ptr         = str_buffer->GetData();
+  data_accessor.memcpy_to(allocation, str_buffer_ptr, total_data_bytes);
 
-  // NULL case
+  // Set the null mask, if necessary
   if (null_count != 0) {
     auto& validity = duckdb::FlatVector::Validity(vector);
     copy_mask_to_validity(validity, row_offset, count, allocation);
-
-    // Get the current offset
-    auto start = offset_accessor.get_current(allocation);
-
-    // Copy each string individually
-    for (size_t i = 0; i < count; ++i) {
-      offset_accessor.advance();
-      auto end = offset_accessor.get_current(allocation);
-
-      assert(start > 0 && end >= start);
-
-      if (!validity.RowIsValid(i)) {
-        dest_ptr[i] = duckdb::string_t(nullptr, 0);
-        start       = end;
-        continue;
-      }
-
-      auto const len = static_cast<size_t>(end - start);
-      auto str       = duckdb::StringVector::EmptyString(vector, len);
-      if (len > 0) {
-        // We may have skipped some data due to nulls, so we need to set the cursor
-        data_accessor.set_cursor(data_accessor.initial_byte_offset + static_cast<size_t>(start));
-        data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len);
-      }
-      str.Finalize();  // Inline the string if possible
-      dest_ptr[i] = str;
-      start       = end;
-    }
-    return;
   }
 
-  // NO NULLS case (fast path)
-  auto start = offset_accessor.get_current(allocation);
-
-  // Each string must be copied individually, as some strings may be inlined into duckdb::string_t
-  for (size_t i = 0; i < count; ++i) {
+  // Construct each string
+  auto strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
+  auto start   = start_offset;
+  for (size_t row = 0; row < count; ++row) {
     offset_accessor.advance();
     auto end = offset_accessor.get_current(allocation);
-
-    assert(start > 0 && end >= start);
-
-    auto const len = static_cast<size_t>(end - start);
-    auto str       = duckdb::StringVector::EmptyString(vector, len);
-    if (len > 0) { data_accessor.memcpy_to(allocation, str.GetDataWriteable(), len); }
-    str.Finalize();  // Inline the string if possible
-    dest_ptr[i] = str;
-    start       = end;
+    if (!duckdb::FlatVector::IsNull(vector, row)) {
+      auto d_ptr   = str_buffer_ptr + (start - start_offset);
+      auto str_len = end - start;
+      strings[row] = duckdb::string_t(reinterpret_cast<char*>(d_ptr), str_len);
+    }
+    start = end;
   }
+
+  duckdb::StringVector::AddBuffer(vector, str_buffer);
 }
 
 host_table_chunk_reader::host_table_chunk_reader(

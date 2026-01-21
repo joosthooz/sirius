@@ -133,10 +133,7 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
       // Byte aligned case
       auto const full_bytes = utils::div_8(num_bits);
       auto const tail_bits  = utils::mod_8(num_bits);
-      for (auto b = 0; b < full_bytes; ++b) {
-        mask_blocks_accessor.set_current(FULL_MASK, allocation);
-        mask_blocks_accessor.advance();
-      }
+      mask_blocks_accessor.memset(FULL_MASK, full_bytes, allocation);
       if (tail_bits > 0) {
         auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
         mask_blocks_accessor.set_current(tail_mask, allocation);
@@ -158,10 +155,7 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
       mask_blocks_accessor.advance();
 
       // Set full bytes
-      for (size_t b = 0; b < remaining_bytes; ++b) {
-        mask_blocks_accessor.set_current(FULL_MASK, allocation);
-        mask_blocks_accessor.advance();
-      }
+      mask_blocks_accessor.memset(FULL_MASK, remaining_bytes, allocation);
 
       // Set tail bits
       if (tail_bits > 0) {
@@ -185,6 +179,7 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
     }
   } else {
     // Byte unaligned case
+    /// TODO: optimize by bulk copying full bytes and then downshifting?
     auto const num_bytes = utils::ceil_div_8(num_bits);
     for (size_t b = 0; b < num_bytes; ++b) {
       auto src_byte = src_valid[b];

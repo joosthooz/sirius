@@ -138,6 +138,25 @@ struct multiple_blocks_allocation_accessor {
   }
 
   /**
+   * @brief Get the value at a specific offset position from the initial offset.
+   */
+  [[nodiscard]] T get(size_t offset,
+                      const std::unique_ptr<multiple_blocks_allocation>& allocation) const
+  {
+    size_t global_offset        = initial_byte_offset + sizeof(T) * offset;
+    size_t temp_block_index     = global_offset / allocation->block_size();
+    size_t temp_offset_in_block = global_offset % allocation->block_size();
+
+    assert(temp_block_index < num_blocks);
+    assert(allocation != nullptr);
+    assert(temp_offset_in_block + sizeof(T) <= block_size);
+
+    return *reinterpret_cast<T*>(
+      reinterpret_cast<uint8_t*>(allocation->get_blocks()[temp_block_index]) +
+      temp_offset_in_block);
+  }
+
+  /**
    * @brief Advance the cursor into the allocation to the next position as type S.
    *
    * @tparam S The type size to use for advancing the cursor.
@@ -156,6 +175,36 @@ struct multiple_blocks_allocation_accessor {
    * @brief Advance the cursor into the allocation to the next position using the underlying type.
    */
   void advance() { advance_as<underlying_type>(); }
+
+  /**
+   * @brief Set a number of consecutive values starting at the current position in the allocation.
+   *
+   * @param[in] value The value to set.
+   * @param[in] count The number of consecutive values to set.
+   * @param[in, out] allocation The allocation.
+   */
+  void memset(uint8_t value, size_t count, std::unique_ptr<multiple_blocks_allocation>& allocation)
+  {
+    size_t bytes     = count;
+    size_t bytes_set = 0;
+    while (bytes_set < bytes) {
+      assert(block_index < allocation->get_blocks().size());
+      // Do as much of a bulk set as possible in the current block
+      auto const bytes_to_set =
+        std::min(bytes - bytes_set, allocation->block_size() - offset_in_block);
+      std::memset(
+        reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
+        value,
+        bytes_to_set);
+      bytes_set += bytes_to_set;
+      offset_in_block += bytes_to_set;
+      // Check if we need to advance to the next block
+      if (offset_in_block == allocation->block_size()) {
+        ++block_index;
+        offset_in_block = 0;
+      }
+    }
+  }
 
   /**
    * @brief Copy from a given source buffer into the allocation starting at the current position.
