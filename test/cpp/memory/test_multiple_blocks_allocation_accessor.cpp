@@ -467,8 +467,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[memory][accessor
 // Test: multiple_blocks_allocation_accessor - Multi-Block Traversal
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
-          "[memory][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal", "[memory][accessor]")
 {
   // Use 32-byte blocks for easier testing
   numa_region_pinned_host_memory_resource upstream_mr(0);

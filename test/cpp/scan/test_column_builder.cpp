@@ -325,7 +325,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
     builder.process_mask_for_column(seed_validity, 1, 0, allocation);
 
     size_t row_offset = 1;
-    auto run_batch = [&](size_t batch_size, std::vector<size_t> invalid_indices) {
+    auto run_batch    = [&](size_t batch_size, std::vector<size_t> invalid_indices) {
       REQUIRE((row_offset % 8) != 0);
       duckdb::ValidityMask validity(batch_size);
       validity.Initialize(batch_size);
