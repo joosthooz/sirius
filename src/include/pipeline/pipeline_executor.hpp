@@ -38,7 +38,7 @@ namespace pipeline {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class pipeline_executor : public sirius::parallel::itask_executor {
+class pipeline_executor {
  public:
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
@@ -55,7 +55,7 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~pipeline_executor() override = default;
+  ~pipeline_executor() = default;
 
   // Non-copyable but movable
   pipeline_executor(const pipeline_executor&)            = delete;

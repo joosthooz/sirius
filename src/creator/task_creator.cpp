@@ -16,11 +16,13 @@
 
 #include "creator/task_creator.hpp"
 
+#include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <memory>
 #include <queue>
 
 namespace sirius::creator {
@@ -84,6 +86,8 @@ task_creator::~task_creator() { stop_thread_pool(); }
 void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {
   _client_context = std::addressof(client_context);
+  _thread_ctx     = std::make_unique<duckdb::ThreadContext>(*_client_context);
+  _exec_ctx = std::make_unique<duckdb::ExecutionContext>(*_client_context, *_thread_ctx, nullptr);
 }
 
 void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map)
@@ -99,6 +103,9 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
 void task_creator::reset()
 {
   _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
+  _exec_ctx.reset();
+  _thread_ctx.reset();
+  _client_context = nullptr;
 }
 
 void task_creator::process_next_task(op::sirius_physical_operator* node)
@@ -181,10 +188,8 @@ void task_creator::worker_function(int worker_id)
           *_client_context,
           &info->_node->Cast<op::sirius_physical_table_scan>(),
           _mem_res_mgr);
-        duckdb::ThreadContext thread_ctx(*_client_context);
-        duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-          *scan_task_global_state, exec_ctx);
+          *scan_task_global_state, *_exec_ctx);
         if (info->destination_data_repositories.empty()) {
           throw std::runtime_error(
             "No destination data repositories provided for scan task creation.");
@@ -215,8 +220,8 @@ void task_creator::worker_function(int worker_id)
           _pipeline_executor.schedule(std::move(task));
         }
       }
-
     } catch (const std::exception& e) {
+      SIRIUS_LOG_INFO("Exception in task creator worker %d: %s", worker_id, e.what());
       stop();
     }
   }
