@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 namespace sirius {
@@ -24,6 +25,7 @@ namespace parallel {
 struct task_executor_config {
   int num_threads{0};
   bool retry_on_error{false};
+  std::string name;
   std::vector<int> cpu_affinity_list;
 };
 
