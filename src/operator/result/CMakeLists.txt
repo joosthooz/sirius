@@ -14,10 +14,6 @@
 # the License.
 # =============================================================================
 
-set(TEST_SOURCES
-    ${TEST_SOURCES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_merge_impl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_partition_impl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/result_collector/test_gpu_physical_result_collector.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/result_collector/test_host_table_chunk_reader.cpp
+set(EXTENSION_SOURCES
+    ${EXTENSION_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/host_table_chunk_reader.cpp
     PARENT_SCOPE)

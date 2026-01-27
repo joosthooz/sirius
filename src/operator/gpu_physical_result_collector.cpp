@@ -17,6 +17,7 @@
 #include "operator/gpu_physical_result_collector.hpp"
 
 #include "cudf_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "gpu_buffer_manager.hpp"
@@ -26,7 +27,18 @@
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
+#include "sirius_context.hpp"
 #include "utils.hpp"
+
+#include <operator/result/host_table_chunk_reader.hpp>
+
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+
+// cucascade
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
 
 namespace duckdb {
 
@@ -515,5 +527,88 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
 // bool PhysicalMaterializedCollector::SinkOrderDependent() const {
 // 	return true;
 // }
+
+/**
+ * @note For now, we assume the input batch, if in the HOST tier, is always in the
+ * host_table_representation, and if the input batch is in the GPU tier, we convert it to the
+ * host_table_representation. In the future, we should register converters for other specialized
+ * data representations and invoke one such here.
+ */
+SinkResultType GPUPhysicalMaterializedCollector::sink(
+  std::shared_ptr<cucascade::data_batch> input_batch, GlobalSinkState& gstate) const
+{
+  using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
+
+  if (!input_batch) {
+    throw InvalidInputException("[GPUPhysicalMaterializedCollector] input_batch is null");
+  }
+  if (!result_collection) {
+    throw InvalidInputException("[GPUPhysicalMaterializedCollector] result_collection is null");
+  }
+
+  auto* data = input_batch->get_data();
+  if (!data) {
+    throw InvalidInputException(
+      "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+  }
+
+  // If data is in GPU tier, convert to HOST tier first
+  if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
+    // Get ClientContext from global sink state
+    auto& collector_state = gstate.Cast<GPUMaterializedCollectorGlobalState>();
+    if (!collector_state.context) {
+      throw InternalException(
+        "[GPUPhysicalMaterializedCollector] ClientContext not set in global sink state");
+    }
+
+    // Make the memory reservation for host memory
+    /// TODO: Find the closest memory space, not just any memory space, in HOST tier
+    auto sirius_context = GetOrCreateSiriusContext(*collector_state.context);
+    auto& memory_mgr    = sirius_context->get_memory_manager();
+    auto reservation    = memory_mgr.request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+      data->get_size_in_bytes());
+    if (!reservation) {
+      throw InternalException(
+        "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
+    }
+
+    // Get the memory space for the reservation
+    auto& mem_space = reservation->get_memory_space();
+
+    // Convert to host representation
+    auto& registry = ::sirius::converter_registry::get();
+    input_batch->convert_to<cucascade::host_table_representation>(
+      registry, &mem_space, rmm::cuda_stream_default);
+
+    data = input_batch->get_data();
+    if (!data) {
+      throw InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+    }
+  } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
+    // Data must be in HOST tier
+    throw InvalidInputException(
+      "[GPUPhysicalMaterializedCollector] Expected host_table_representation in HOST tier");
+  }
+
+  // Only accepting host_table_representations for now
+  assert(dynamic_cast<cucascade::host_table_representation*>(data) != nullptr);
+  auto const& host_table = data->cast<cucascade::host_table_representation>();
+
+  // Initialize chunk reader
+  host_table_chunk_reader chunk_reader(host_table, types);
+
+  // Push chunks to result collection
+  auto const num_chunks = chunk_reader.calculate_num_chunks();
+  result_collection->SetCapacity(num_chunks);
+  for (size_t i = 0; i < num_chunks; i++) {
+    duckdb::DataChunk chunk;
+    if (!chunk_reader.get_next_chunk(chunk)) { break; }
+    result_collection->AddChunk(chunk);
+  }
+
+  return SinkResultType::FINISHED;
+}
 
 }  // namespace duckdb

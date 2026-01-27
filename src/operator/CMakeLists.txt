@@ -14,6 +14,8 @@
 # the License.
 # =============================================================================
 
+add_subdirectory(result)
+
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_column_data_scan.cpp

@@ -22,6 +22,12 @@
 #include "gpu_physical_operator.hpp"
 #include "gpu_query_result.hpp"
 
+// cucascade
+#include <cucascade/data/data_batch.hpp>
+
+// standard library
+#include <memory>
+
 namespace duckdb {
 
 class GPUPreparedStatementData;
@@ -85,6 +91,20 @@ class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
   static size_t FinalMaterialize(GPUIntermediateRelation input_relation,
                                  GPUIntermediateRelation& output_relation,
                                  size_t col);
+
+  /**
+   * @brief Sink a data batch into the result collection
+   *
+   * @param[in] input_batch The input data batch
+   * @param[in] gstate The global sink state containing the ClientContext
+   * @return SinkResultType The result of the sink operation (currently, only FINISHED is returned)
+   * @throws InvalidInputException if input_batch or result_collection is null, if the data_batch
+   * has no data, or if data currently resides in the DISK tier
+   * @throws InternalException if the memory manager is not initialized, if the reservation fails,
+   * or if the memory space for the reservation is invalid
+   */
+  SinkResultType sink(std::shared_ptr<cucascade::data_batch> input_batch,
+                      GlobalSinkState& gstate) const;
 };
 
 }  // namespace duckdb

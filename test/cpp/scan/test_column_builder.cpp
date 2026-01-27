@@ -30,6 +30,7 @@
 // standard library
 #include <filesystem>
 #include <numbers>
+#include <vector>
 
 using namespace sirius::op::scan;
 using namespace cucascade::memory;
@@ -310,35 +311,67 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
     REQUIRE((mask_byte_1 & (1 << 7)) == 0);
   }
 
-  SECTION("byte-unaligned mask processing")
+  SECTION("byte-unaligned mask processing with non-byte-sized vectors")
   {
     auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
     duckdb_scan_task_local_state::column_builder builder(int_type, 256);
 
-    size_t num_rows   = 100;
+    size_t num_rows   = 64;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
     auto allocation   = create_test_allocation(total_size);
     builder.initialize_accessors(num_rows, 0, allocation);
 
-    // First, add 3 rows (to create a 3-bit offset)
-    duckdb::ValidityMask validity1(3);
-    validity1.Initialize(3);
-    validity1.SetAllValid(3);
-    builder.process_mask_for_column(validity1, 3, 0, allocation);
+    size_t mask_offset = sizeof(int32_t) * num_rows;
+    size_t mask_bytes  = sirius::utils::ceil_div_8(num_rows);
+    builder.mask_blocks_accessor.set_cursor(mask_offset);
+    builder.mask_blocks_accessor.memset(0, mask_bytes, allocation);
+    builder.mask_blocks_accessor.set_cursor(mask_offset);
 
-    // Now add 8 more rows starting at bit offset 3 (byte-unaligned)
-    duckdb::ValidityMask validity2(8);
-    validity2.Initialize(8);
-    validity2.SetAllValid(8);
-    validity2.SetInvalid(2);  // Should be at bit position 5 (3 + 2) overall
-    builder.process_mask_for_column(validity2, 8, 3, allocation);
+    constexpr size_t total_rows = 22;
+    std::vector<uint8_t> expected_valid(total_rows, 1);
+    auto mark_invalid = [&](size_t row) { expected_valid[row] = 0; };
 
-    // Verify the unaligned write worked
-    builder.mask_blocks_accessor.set_cursor(0);
-    auto mask_byte_0 = builder.mask_blocks_accessor.get_current(allocation);
+    // Seed one row so the next batch starts at a non-byte offset.
+    duckdb::ValidityMask seed_validity(1);
+    seed_validity.Initialize(1);
+    seed_validity.SetAllValid(1);
+    seed_validity.SetInvalid(0);
+    mark_invalid(0);
+    builder.process_mask_for_column(seed_validity, 1, 0, allocation);
 
-    // Bit 5 should be 0 (invalid)
-    REQUIRE((mask_byte_0 & (1 << 5)) == 0);
+    size_t row_offset = 1;
+    auto run_batch    = [&](size_t batch_size, std::vector<size_t> invalid_indices) {
+      REQUIRE((row_offset % 8) != 0);
+      duckdb::ValidityMask validity(batch_size);
+      validity.Initialize(batch_size);
+      validity.SetAllValid(batch_size);
+      for (auto idx : invalid_indices) {
+        validity.SetInvalid(idx);
+        mark_invalid(row_offset + idx);
+      }
+      builder.process_mask_for_column(validity, batch_size, row_offset, allocation);
+      row_offset += batch_size;
+    };
+
+    run_batch(3, {0, 2});
+    run_batch(5, {1, 4});
+    run_batch(6, {0, 5});
+    run_batch(7, {0, 6});
+
+    REQUIRE(row_offset == total_rows);
+
+    builder.mask_blocks_accessor.set_cursor(mask_offset);
+    size_t bytes_to_check = sirius::utils::ceil_div_8(total_rows);
+    std::vector<uint8_t> mask(bytes_to_check);
+    for (size_t i = 0; i < bytes_to_check; ++i) {
+      mask[i] = builder.mask_blocks_accessor.get_current(allocation);
+      builder.mask_blocks_accessor.advance();
+    }
+
+    for (size_t row = 0; row < total_rows; ++row) {
+      bool is_valid = (mask[row / 8] & (1 << (row % 8))) != 0;
+      REQUIRE(is_valid == static_cast<bool>(expected_valid[row]));
+    }
   }
 
   SECTION("null_count reflects invalid rows in validity mask")

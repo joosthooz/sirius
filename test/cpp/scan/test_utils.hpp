@@ -17,17 +17,19 @@
 #pragma once
 
 // sirius
-#include "memory/sirius_memory_reservation_manager.hpp"
-
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
+
+// cucascade
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // standard library
 #include <vector>
 
 // rmm
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
+#include <rmm/mr/device/per_device_resource.hpp>
 
 using namespace cucascade::memory;
 
@@ -57,6 +59,15 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
     .set_reservation_fraction_per_host(limit_ratio);
 
   auto space_configs = builder.build();
-  return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto memory_reservation_manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+
+  // Ensure cudf uses the same device resource as the memory manager.
+  auto* gpu_space = memory_reservation_manager->get_memory_space(Tier::GPU, 0);
+  if (gpu_space) {
+    auto* allocator = gpu_space->get_default_allocator();
+    rmm::mr::set_current_device_resource(allocator);
+    rmm::mr::set_current_device_resource_ref(rmm::device_async_resource_ref{*allocator});
+  }
+  return memory_reservation_manager;
 }
