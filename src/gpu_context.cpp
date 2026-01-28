@@ -31,6 +31,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "sirius_extension.hpp"
 
@@ -204,6 +205,15 @@ unique_ptr<QueryResult> GPUContext::GPUExecuteQuery(
     current_result = GPUExecutePendingQueryResult(*pending_query);
   }
   SIRIUS_LOG_DEBUG("Done GPUExecuteQuery");
+
+  // Log peak GPU memory usage
+  auto& buffer_mgr = GPUBufferManager::GetInstance();
+  auto peak_bytes  = buffer_mgr.get_peak_allocated_bytes();
+  SIRIUS_LOG_INFO("Query finished - Peak GPU memory allocated: {:.2f} MB ({} bytes)",
+                  peak_bytes / (1024.0 * 1024.0),
+                  peak_bytes);
+  buffer_mgr.reset_peak_memory();
+
   return current_result;
 };
 

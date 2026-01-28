@@ -332,6 +332,15 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
       throw InvalidInputException("Pointer already exists in allocation table");
     }
     allocation_table[gpu][ptr] = alloc;
+
+    // Track peak memory usage
+    uint64_t current = current_allocated_bytes.fetch_add(alloc, std::memory_order_relaxed) + alloc;
+    uint64_t peak    = peak_allocated_bytes.load(std::memory_order_relaxed);
+    while (current > peak &&
+           !peak_allocated_bytes.compare_exchange_weak(peak, current, std::memory_order_relaxed)) {
+      // peak was updated by another thread, retry
+    }
+
     return reinterpret_cast<T*>(ptr);
   }
 };
@@ -360,6 +369,10 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
   auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
   if (it != allocation_table[gpu].end()) {
     // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
+
+    // Track memory deallocation
+    current_allocated_bytes.fetch_sub(it->second, std::memory_order_relaxed);
+
     mr->deallocate((void*)ptr, it->second);
     allocation_table[gpu].erase(it);
   } else {

@@ -19,6 +19,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "extension_lock.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
@@ -71,7 +72,12 @@ SiriusContext::~SiriusContext() noexcept
   if (is_initialized_) { terminate(); }
 }
 
-void SiriusContext::QueryBegin(ClientContext& context) {}
+void SiriusContext::QueryBegin(ClientContext& context)
+{
+  // Reset peak memory tracking at query start
+  auto& buffer_mgr = duckdb::GPUBufferManager::GetInstance();
+  buffer_mgr.reset_peak_memory();
+}
 
 void SiriusContext::QueryEnd() {}
 

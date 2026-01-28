@@ -147,6 +147,21 @@ class GPUBufferManager {
   vector<map<void*, uint64_t>> allocation_table;
   vector<map<void*, uint64_t>> locked_allocation_table;
 
+  // Peak memory tracking
+  std::atomic<uint64_t> current_allocated_bytes{0};
+  std::atomic<uint64_t> peak_allocated_bytes{0};
+
+  void reset_peak_memory()
+  {
+    current_allocated_bytes.store(0, std::memory_order_relaxed);
+    peak_allocated_bytes.store(0, std::memory_order_relaxed);
+  }
+
+  uint64_t get_peak_allocated_bytes() const
+  {
+    return peak_allocated_bytes.load(std::memory_order_relaxed);
+  }
+
  private:
   // Private constructor
   GPUBufferManager(size_t cache_size_per_gpu,
