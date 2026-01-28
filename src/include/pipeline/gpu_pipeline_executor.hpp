@@ -32,21 +32,6 @@ namespace pipeline {
 
 class pipeline_executor;
 
-class local_task_buffer {
- public:
-  local_task_buffer() = default;
-  void produce(std::unique_ptr<sirius::parallel::itask> task);
-  std::unique_ptr<sirius::parallel::itask> consume();
-  void open();
-  void close();
-
- private:
-  mutable std::mutex _mtx;
-  std::condition_variable _cv;
-  std::queue<std::unique_ptr<sirius::parallel::itask>> _queue;
-  std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
-};
-
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
  *
@@ -143,8 +128,10 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   gpu_pipeline_task* cast_to_gpu_pipeline_task(sirius::parallel::itask* task);
 
+  std::mutex _task_count_mutex;
+  std::size_t _num_active_requests{0};
+  std::condition_variable _req_count_cv;
   std::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
-  std::unique_ptr<local_task_buffer> _local_task_buffer;
   pipeline_executor* _pipeline_exec;
   const cucascade::memory::memory_space*
     _memory_space_view;  // this is supposed to be the memory space

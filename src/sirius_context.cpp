@@ -99,11 +99,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
-  pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(), *memory_manager_, &config_.get_hw_topology());
-
-  downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
-    config_.get_downgrade_executor_config(), *data_repository_manager_);
   bool is_scan_caching_enabled = config_.is_scan_caching_enabled();
   if (is_scan_caching_enabled) {
     duckdb_scan_executor_ = std::make_unique<sirius::op::scan::caching_duckdb_scan_executor>(
@@ -112,6 +107,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
       config_.get_duckdb_scan_executor_config());
   }
+
+  pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
+    config_.get_gpu_pipeline_executor_config(), *memory_manager_, &config_.get_hw_topology());
+  pipeline_executor_->set_scan_executor(*duckdb_scan_executor_);
+  duckdb_scan_executor_->set_pipeline_executor(pipeline_executor_.get());
+
+  downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
+    config_.get_downgrade_executor_config(), *data_repository_manager_);
 
   task_creator_ =
     std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),

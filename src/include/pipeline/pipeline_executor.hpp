@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -38,7 +39,7 @@ namespace pipeline {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class pipeline_executor {
+class pipeline_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
@@ -55,7 +56,12 @@ class pipeline_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~pipeline_executor() = default;
+  ~pipeline_executor() override = default;
+
+  void set_scan_executor(sirius::op::scan::duckdb_scan_executor& scan_executor)
+  {
+    _duckdb_scan_executor = &scan_executor;
+  }
 
   // Non-copyable but movable
   pipeline_executor(const pipeline_executor&)            = delete;
@@ -118,6 +124,7 @@ class pipeline_executor {
 
  private:
   std::vector<std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;  ///< Vector of GPU executors
+  sirius::op::scan::duckdb_scan_executor* _duckdb_scan_executor;
   std::unique_ptr<task_request_queue> _task_request_queue;
 };
 

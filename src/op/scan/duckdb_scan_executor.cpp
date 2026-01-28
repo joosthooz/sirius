@@ -16,6 +16,8 @@
 
 // sirius
 #include <op/scan/duckdb_scan_executor.hpp>
+#include <pipeline/pipeline_executor.hpp>
+#include <pipeline/task_request.hpp>
 
 // standard library
 #include <mutex>
@@ -30,6 +32,14 @@ void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> tas
   }
   _task_queue->push(std::move(task));
 }
+
+void duckdb_scan_executor::start()
+{
+  itask_executor::start();
+  _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
+}
+
+void duckdb_scan_executor::stop() { itask_executor::stop(); }
 
 void duckdb_scan_executor::wait()
 {
@@ -62,6 +72,24 @@ void duckdb_scan_executor::worker_loop(int32_t worker_id)
         _finish_cv.notify_one();
       }
     }
+  }
+}
+
+void duckdb_scan_executor::set_pipeline_executor(pipeline::pipeline_executor* pipeline_exec)
+{
+  _pipeline_exec = pipeline_exec;
+}
+
+void duckdb_scan_executor::manager_loop()
+{
+  while (_running) {
+    std::unique_lock<std::mutex> lock(_task_count_mutex);
+    _req_count_cv.wait(
+      lock, [this]() { return _num_active_requests < _config.num_threads || !_running.load(); });
+    if (!_running.load()) { break; }
+    _num_active_requests++;
+    lock.unlock();
+    _pipeline_exec->submit_task_request(std::make_unique<pipeline::task_request>(-1, true));
   }
 }
 
