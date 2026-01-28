@@ -37,7 +37,7 @@ struct task_request {
 
 class task_request_queue {
  public:
-  task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
+  explicit task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
   void open();
   void close();
   void push(std::unique_ptr<task_request> request);

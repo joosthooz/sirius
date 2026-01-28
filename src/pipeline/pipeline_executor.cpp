@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -35,7 +36,6 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   auto num_gpus   = gpu_spaces.size();
   // Initialize GPU pipeline executors for each available GPU
-  _gpu_executors.reserve(num_gpus);
   for (auto* space : gpu_spaces) {
     auto config = gpu_task_executor_config;
     if (sys_topology) {
@@ -47,14 +47,20 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
     }
-    _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, space, this));
+    _gpu_executors[space->get_device_id()] =
+      std::make_unique<gpu_pipeline_executor>(config, space, this);
   }
   _task_request_queue = std::make_unique<task_request_queue>(1);
 }
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  _task_queue->push(std::move(task));
+  if (dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(task.get())) {
+    _task_queue->push(std::move(task));
+  } else {
+    /// todo (amin): redo this whole duckdb scan executor handling
+    _duckdb_scan_executor->schedule(std::move(task));
+  }
 }
 
 void pipeline_executor::on_start()
@@ -79,7 +85,7 @@ void pipeline_executor::start()
     _threads.emplace_back(&pipeline_executor::worker_loop, this, i);
   }
   // Start all GPU executors
-  for (auto& gpu_exec : _gpu_executors) {
+  for (auto& [gpu_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
   }
 }
@@ -89,7 +95,7 @@ void pipeline_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   // Stop all GPU executors
-  for (auto& gpu_exec : _gpu_executors) {
+  for (auto& [gpu_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
   }
   on_stop();
@@ -117,11 +123,6 @@ void pipeline_executor::worker_loop(int worker_id)
       break;
     }
     try {
-      // TODO
-      // Make reservation (prioritize GPU with the same memory space as the input)
-      // If approved, dispatch to the corresponding GPU executor
-      // If no reservation, use some policy to pick the best GPU executor
-      // Dispatch to the selected GPU executor based on the request
       int gpu_id = request ? request->device_id : 0;
       dispatch_to_gpu_executor(std::move(task), gpu_id);  // For now we just dispatch to GPU 0
     } catch (const std::exception& e) {
@@ -138,10 +139,7 @@ void pipeline_executor::submit_task_request(std::unique_ptr<task_request> reques
 void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task,
                                                  int gpu_id)
 {
-  if (gpu_id < 0 || gpu_id >= static_cast<int>(_gpu_executors.size())) {
-    throw std::runtime_error("Invalid GPU ID: " + std::to_string(gpu_id));
-  }
-  _gpu_executors[gpu_id]->schedule(std::move(task));
+  _gpu_executors.at(gpu_id)->schedule(std::move(task));
 }
 
 }  // namespace pipeline
