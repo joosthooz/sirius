@@ -118,8 +118,7 @@ TEST_CASE("Pipeline executor executes tasks through pipeline_queue", "[pipeline_
     auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
 
     // Submit task request
-    auto request       = std::make_unique<task_request>();
-    request->device_id = 0;
+    auto request = std::make_unique<task_request>(0);
     executor.submit_task_request(std::move(request));
 
     // Schedule task
@@ -169,8 +168,7 @@ TEST_CASE("Pipeline executor dispatches tasks to multiple GPU executors", "[pipe
       auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
 
       // Submit task request with specific GPU ID
-      auto request       = std::make_unique<task_request>();
-      request->device_id = gpu_id;
+      auto request = std::make_unique<task_request>(gpu_id);
       executor.submit_task_request(std::move(request));
 
       // Schedule task
@@ -248,8 +246,7 @@ TEST_CASE("Pipeline executor handles rapid task submission", "[pipeline_executor
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
     auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
 
-    auto request       = std::make_unique<task_request>();
-    request->device_id = i % 2;  // Alternate between 2 GPUs
+    auto request = std::make_unique<task_request>(i % 2);
     executor.submit_task_request(std::move(request));
     executor.schedule(std::move(task));
   }
@@ -290,8 +287,7 @@ TEST_CASE("Pipeline executor task and request queue synchronization", "[pipeline
   const int num_pairs = 20;
   for (int i = 0; i < num_pairs; ++i) {
     // Submit request first
-    auto request       = std::make_unique<task_request>();
-    request->device_id = i % 2;
+    auto request = std::make_unique<task_request>(i % 2);
     executor.submit_task_request(std::move(request));
 
     // Then submit corresponding task
@@ -331,8 +327,7 @@ TEST_CASE("Multiple start/stop cycles work correctly", "[pipeline_executor]")
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
     auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
 
-    auto request       = std::make_unique<task_request>();
-    request->device_id = 0;
+    auto request = std::make_unique<task_request>(0);
     executor.submit_task_request(std::move(request));
     executor.schedule(std::move(task));
   }
@@ -359,8 +354,7 @@ TEST_CASE("Multiple start/stop cycles work correctly", "[pipeline_executor]")
     auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i + num_tasks, 0);
     auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
 
-    auto request       = std::make_unique<task_request>();
-    request->device_id = 0;
+    auto request = std::make_unique<task_request>(0);
     executor.submit_task_request(std::move(request));
     executor.schedule(std::move(task));
   }

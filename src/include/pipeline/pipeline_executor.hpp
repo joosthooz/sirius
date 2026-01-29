@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -27,6 +28,8 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+
+#include <unordered_map>
 
 namespace sirius {
 namespace pipeline {
@@ -56,6 +59,11 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    * @brief Destructor for the gpu_pipeline_executor.
    */
   ~pipeline_executor() override = default;
+
+  void set_scan_executor(sirius::op::scan::duckdb_scan_executor& scan_executor)
+  {
+    _duckdb_scan_executor = &scan_executor;
+  }
 
   // Non-copyable but movable
   pipeline_executor(const pipeline_executor&)            = delete;
@@ -117,7 +125,9 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   void submit_task_request(std::unique_ptr<task_request> request);
 
  private:
-  std::vector<std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;  ///< Vector of GPU executors
+  std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+
+  sirius::op::scan::duckdb_scan_executor* _duckdb_scan_executor;
   std::unique_ptr<task_request_queue> _task_request_queue;
 };
 

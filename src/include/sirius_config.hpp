@@ -58,6 +58,8 @@ struct sirius_config {
   [[nodiscard]] const parallel::task_executor_config& get_duckdb_scan_executor_config()
     const noexcept;
 
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return enable_scan_caching_; }
+
  private:
   cucascade::memory::system_topology_info _hw_topology;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
@@ -67,6 +69,7 @@ struct sirius_config {
                                                             .retry_on_error = false};
   parallel::task_executor_config _duckdb_scan_executor_config{.num_threads    = 4,
                                                               .retry_on_error = false};
+  bool enable_scan_caching_         = false;
   size_t _task_creator_thread_count = 4;
 };
 

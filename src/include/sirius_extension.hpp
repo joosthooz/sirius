@@ -27,7 +27,7 @@ class SiriusExtension : public Extension {
   std::string Name() override;
   std::string Version() const override;
   static void InitialGPUConfigs(DBConfig& db);
-  static void RegisterGPUFunctions(ClientContext& context);
+  static void RegisterGPUFunctions(DatabaseInstance& catalog);
   static void GPUProcessingSubstraitFunction(ClientContext& context,
                                              TableFunctionInput& data_p,
                                              DataChunk& output);
@@ -35,8 +35,8 @@ class SiriusExtension : public Extension {
                                     TableFunctionInput& data_p,
                                     DataChunk& output);
   static void GPUExecutionFunction(ClientContext& context,
-                                    TableFunctionInput& data_p,
-                                    DataChunk& output);
+                                   TableFunctionInput& data_p,
+                                   DataChunk& output);
   // static void GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk
   // &output);
   static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext& context,
@@ -57,9 +57,9 @@ class SiriusExtension : public Extension {
                                                     vector<LogicalType>& return_types,
                                                     vector<string>& names);
   static unique_ptr<FunctionData> GPUExecutionBind(ClientContext& context,
-                                                             TableFunctionBindInput& input,
-                                                             vector<LogicalType>& return_types,
-                                                             vector<string>& names);
+                                                   TableFunctionBindInput& input,
+                                                   vector<LogicalType>& return_types,
+                                                   vector<string>& names);
 
   static bool buffer_is_initialized;
 };

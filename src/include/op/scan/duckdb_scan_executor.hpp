@@ -17,10 +17,16 @@
 #pragma once
 
 // sirius
-#include <op/scan/duckdb_scan_task_queue.hpp>
-#include <parallel/task_executor.hpp>
+#include "op/scan/duckdb_scan_task_queue.hpp"
+#include "parallel/task_executor.hpp"
 
-namespace sirius::op::scan {
+namespace sirius {
+
+namespace pipeline {
+class pipeline_executor;  // Forward declaration
+}
+
+namespace op::scan {
 
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Executor
@@ -41,6 +47,11 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
                                        config)
   {
   }
+
+  void start() override;
+  void stop() override;
+
+  void set_pipeline_executor(pipeline::pipeline_executor* pipeline_exec);
 
   //===----------Methods----------===//
   /**
@@ -63,6 +74,11 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
   void worker_loop(int32_t worker_id) override;
 
   /**
+   * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
+   */
+  void manager_loop();
+
+  /**
    * @brief Get the number of threads in the thread pool for this executor.
    *
    * @return The number of threads in the thread pool for this executor.
@@ -71,10 +87,18 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
 
   //===----------Fields----------===//
  private:
+  std::thread _manager_thread;
+  std::mutex _task_count_mutex;
+  std::size_t _num_active_requests{0};
+  std::condition_variable _req_count_cv;
+  std::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
+  pipeline::pipeline_executor* _pipeline_exec;
+
   std::atomic<uint64_t> _total_tasks    = 0;  ///< The total number of scheduled tasks
   std::atomic<uint64_t> _finished_tasks = 0;  ///< The total number of finished tasks
   std::mutex _finish_mutex;                   ///< Mutex to protect condition variable
   std::condition_variable _finish_cv;         ///< Condition variable to signal task completion
 };
 
-}  // namespace sirius::op::scan
+}  // namespace op::scan
+}  // namespace sirius

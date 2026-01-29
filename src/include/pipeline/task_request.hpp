@@ -15,6 +15,7 @@
  */
 
 #pragma once
+
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
@@ -23,16 +24,20 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <optional>
+
 namespace sirius {
 namespace pipeline {
 
 struct task_request {
-  int device_id;
+  explicit task_request(int dev_id, bool is_scan = false) : device_id(dev_id), is_scan(is_scan) {}
+  const int device_id;
+  const bool is_scan;
 };
 
 class task_request_queue {
  public:
-  task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
+  explicit task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
   void open();
   void close();
   void push(std::unique_ptr<task_request> request);
