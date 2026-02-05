@@ -473,14 +473,18 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
   l_state._row_offset += l_state._chunk.size();
 }
 
+// Note: this is currently not called, because the scan executor will either pull the data from
+// cache or call compute_task() directly.
 void duckdb_scan_task::execute()
 {
+  printf("DuckDB Scan Task: executing task %lu\n", _task_id);
   auto output_batches = compute_task();
   publish_output(output_batches);
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task()
 {
+  printf("DuckDB Scan Task: computing task %lu\n", _task_id);
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
@@ -526,15 +530,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
+    printf("DuckDB Scan Task: scheduling follow-up task %lu\n", new_task_id);
     g_state._pipeline_executor.schedule(std::move(next_task));
   }
 
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
+    printf("DuckDB Scan Task: making data batch for task %lu\n", _task_id);
     return std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()};
   }
 
-  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+  return {};
 }
 
 void duckdb_scan_task::publish_output(

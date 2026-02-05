@@ -184,6 +184,9 @@ void pipeline_executor::management_eventloop()
         SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
         break;
       }
+      printf(
+        "pipeline_executor::management_eventloop() Scheduling task to GPU executor for device %d\n",
+        request->device_id);
       _gpu_executors.at(request->device_id)->schedule(std::move(task));
     } else {
       schedule_next_scan_tasks();
@@ -198,6 +201,11 @@ void pipeline_executor::schedule_next_scan_tasks()
     auto* scan_op = _priority_scans.front();
     _priority_scans.pop();
     for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
+      printf(
+        "pipeline_executor::schedule_next_scan_tasks() Scheduling scan task to task creator "
+        "(instance %d of %d)\n",
+        i,
+        _scan_executor->get_num_threads());
       _task_creator->schedule(scan_op);
     }
   }

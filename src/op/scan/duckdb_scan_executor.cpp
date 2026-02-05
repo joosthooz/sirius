@@ -209,11 +209,13 @@ void duckdb_scan_executor::manager_loop()
         t.reset();
         if (_task_creator) {
           for (auto* consumer : consumers) {
+            printf("DuckDB Scan Executor: scheduling consumer %p\n", consumer->get_name().c_str());
             _task_creator->schedule(consumer);
           }
         }
       } catch (...) {
         /// this is fatal error
+        printf("DuckDB Scan Executor: caught unknown exception in manager loop\n");
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
       }
     });

@@ -126,12 +126,13 @@ void task_creator::schedule(op::sirius_physical_operator* node)
 void task_creator::manager_loop()
 {
   while (_running.load()) {
+    printf("task_creator::manager_loop(): acquiring ticket\n");
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {
       SIRIUS_LOG_INFO("Task Creator: Kiosk interrupted, stopping manager loop");
       break;
     }
-
+    printf("task_creator::manager_loop(): getting request from queue\n");
     auto request = _task_creation_queue.pop();
     if (!request) {
       SIRIUS_LOG_INFO("Task Creator: task queue interrupted, stopping manager loop");
@@ -139,25 +140,31 @@ void task_creator::manager_loop()
     }
 
     // Schedule the task creation work on the thread pool
+    printf("task_creator::manager_loop(): scheduling task creation work on thread pool\n");
     _thread_pool->schedule(
       [this, request = std::move(request), ticket = std::move(ticket)]() mutable {
         try {
+          printf("Lambda starting task creation\n");
           auto node = request->node;
           if (node == nullptr) { return; }
 
           node = get_operator_for_next_task(node);
           if (node == nullptr) { return; }
 
-          // Get what we need to create the task
+          // Get what we need to create the task`
           auto pipeline = node->get_pipeline();
+          printf("Lambda getting destination data repositories for pipeline %p\n", pipeline.get());
           std::vector<cucascade::shared_data_repository*> destination_data_repositories;
           auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
           for (auto& [next_op, port_id] : next_port_after_sink) {
+            printf("Lambda getting destination data repository for operator %s\n",
+                   next_op->get_name().c_str());
             destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
           }
 
           // scheduling scan task
           if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+            printf("Lambda creating scan task for operator %s\n", node->get_name().c_str());
             // Check to see if you need to create a new global state for this scan operator
             size_t operator_id = node->get_operator_id();
             {
@@ -189,11 +196,15 @@ void task_creator::manager_loop()
               std::move(scan_task_local_state),
               _scan_operator_global_state_map[operator_id]);
 
+            printf("Lambda scheduling scan task to pipeline executor\n");
             _pipeline_executor->schedule(std::move(scan_task));
             // scheduling pipeline task
           } else {
+            printf("Lambda creating pipeline task for operator %s\n", node->get_name().c_str());
             // need to exhaust input batches until all ports are empty
             while (!node->all_ports_empty()) {
+              printf("Lambda getting next task input batch for operator %s\n",
+                     node->get_name().c_str());
               auto input_batch = node->get_next_task_input_batch();
               if (!input_batch.has_value()) { break; }
               pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
@@ -205,6 +216,9 @@ void task_creator::manager_loop()
                 std::lock_guard<std::mutex> lock(_global_state_mutex);
                 auto it = _gpu_operator_global_state_map.find(operator_id);
                 if (it == _gpu_operator_global_state_map.end()) {
+                  printf("Lambda creating new global state for operator %s with pipeline %p\n",
+                         node->get_name().c_str(),
+                         pipeline.get());
                   // If not found, create new global state and store it in the map
                   auto gpu_pipeline_task_global_state =
                     std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
@@ -212,6 +226,10 @@ void task_creator::manager_loop()
                 }
               }
 
+              printf(
+                "Lambda creating local state for operator %s, with global state->_pipeline %p\n",
+                node->get_name().c_str(),
+                _gpu_operator_global_state_map[operator_id]->_pipeline.get());
               auto local_state =
                 std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch.value());
               auto task = std::make_unique<pipeline::gpu_pipeline_task>(
@@ -219,10 +237,12 @@ void task_creator::manager_loop()
                 destination_data_repositories,
                 std::move(local_state),
                 _gpu_operator_global_state_map[operator_id]);
+              printf("Lambda scheduling pipeline task to pipeline executor\n");
               _pipeline_executor->schedule(std::move(task));
             }
           }
         } catch (const std::exception& e) {
+          printf("Lambda caught exception: %s\n", e.what());
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
           stop();
         }

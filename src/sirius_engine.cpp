@@ -899,6 +899,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       SIRIUS_LOG_DEBUG("");  // Blank line between pipelines
     }
     SIRIUS_LOG_DEBUG("=== END DETAILED PIPELINE DEBUG INFO ===\n");
+    spdlog::default_logger()->flush();
 
     // Flush immediately to ensure all debug output is written synchronously
     // spdlog::default_logger()->flush();

@@ -88,9 +88,11 @@ class thread_pool {
       try {
         fn();
       } catch (const std::exception& e) {
+        printf("Exception in thread pool task: %s\n", e.what());
         SIRIUS_LOG_ERROR("Exception in thread pool task: {}, {}", e.what(), "closing thread pool");
         stop();
       } catch (...) {
+        printf("Unknown exception in thread pool task\n");
         SIRIUS_LOG_ERROR("Exception in thread pool task, closing thread pool");
         stop();
       }

@@ -80,29 +80,47 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: Failed to send task request, channel is closed");
       break;
     }
+    printf("GPU Pipeline Executor: manager loop: acquiring task from queue\n");
     auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
     }
+    printf("GPU Pipeline Executor: manager loop: casting task to gpu_pipeline_task\n");
     auto* gpu_task   = cast_to_gpu_pipeline_task(pipeline_task.get());
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
+    printf("GPU Pipeline Executor: manager loop: making reservation for task %lu\n",
+           gpu_task->get_task_id());
     auto reservation = _memory_space->make_reservation(bytes_needs);
     if (!reservation) {
+      printf("GPU Pipeline Executor: manager loop: failed to make reservation for task %lu\n",
+             gpu_task->get_task_id());
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
       break;
     }
+    printf("GPU Pipeline Executor: manager loop: reservation made for task %lu\n",
+           gpu_task->get_task_id());
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
           gpu_task->local_state())) {
+      printf("GPU Pipeline Executor: manager loop: setting reservation for task %lu\n",
+             gpu_task->get_task_id());
       local_state->set_reservation(std::move(reservation));
     } else {
+      printf("GPU Pipeline Executor: manager loop: failed to cast local state for task %lu\n",
+             gpu_task->get_task_id());
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());
       break;
     }
+    printf("GPU Pipeline Executor: manager loop: getting output consumers for task %lu\n",
+           gpu_task->get_task_id());
     auto output_consumers = gpu_task->get_output_consumers();
-    auto* pipeline        = gpu_task->get_pipeline();
+    printf("GPU Pipeline Executor: manager loop: getting pipeline for task %lu\n",
+           gpu_task->get_task_id());
+    auto* pipeline = gpu_task->get_pipeline();
+    printf("GPU Pipeline Executor: manager loop: scheduling task %lu to thread pool\n",
+           gpu_task->get_task_id());
     _thread_pool->schedule([this,
                             task      = std::move(pipeline_task),
                             ticket    = std::move(ticket),
