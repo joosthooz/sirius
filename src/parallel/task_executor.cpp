@@ -16,6 +16,8 @@
 
 #include "parallel/task_executor.hpp"
 
+#include "log/logging.hpp"
+
 #include <cudf/utilities/default_stream.hpp>
 
 namespace sirius {
@@ -49,17 +51,6 @@ void itask_executor::on_start() { _task_queue->open(); }
 
 void itask_executor::on_stop() { _task_queue->close(); }
 
-void itask_executor::on_task_error(int worker_id,
-                                   std::unique_ptr<itask> task,
-                                   const std::exception& e)
-{
-  if (_config.retry_on_error) {
-    schedule(std::move(task));
-  } else {
-    stop();
-  }
-}
-
 void itask_executor::worker_loop(int worker_id)
 {
   while (true) {
@@ -75,7 +66,19 @@ void itask_executor::worker_loop(int worker_id)
     try {
       task->execute(cudf::get_default_stream());
     } catch (const std::exception& e) {
-      on_task_error(worker_id, std::move(task), e);
+      if (_config.retry_on_error) {
+        SIRIUS_LOG_ERROR("itask_executor::worker_loop(): Error executing task, retrying: {}",
+                         e.what());
+        schedule(std::move(task));
+      } else {
+        SIRIUS_LOG_ERROR(
+          "itask_executor::worker_loop(): Error executing task, stopping executor: {}", e.what());
+        stop();
+      }
+    } catch (...) {
+      SIRIUS_LOG_ERROR(
+        "itask_executor::worker_loop(): Unknown error executing task, stopping executor");
+      stop();
     }
   }
 }

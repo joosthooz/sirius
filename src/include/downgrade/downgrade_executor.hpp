@@ -88,32 +88,6 @@ class downgrade_executor : public itask_executor {
    */
   void schedule(std::unique_ptr<itask> task) override;
 
-  /**
-   * @brief Main worker loop for executing downgrade tasks
-   *
-   * Each worker thread runs this loop to continuously pull and execute downgrade
-   * tasks from the queue. Includes specialized error handling and resource cleanup
-   * for memory tier operations.
-   *
-   * @param worker_id The unique identifier for this worker thread
-   */
-  void worker_loop(int worker_id) override;
-
-  /**
-   * @brief Starts the executor and initializes worker threads
-   *
-   * Initializes the thread pool and begins accepting tasks for execution.
-   */
-  void start() override;
-
-  /**
-   * @brief Stops the executor and cleanly shuts down worker threads
-   *
-   * Stops accepting new tasks and waits for all worker threads to complete
-   * their current tasks before shutting down.
-   */
-  void stop() override;
-
  private:
   /**
    * @brief Safely casts itask to downgrade_task with type validation
@@ -124,7 +98,6 @@ class downgrade_executor : public itask_executor {
    */
   downgrade_task* cast_to_downgrade_task(itask* task);
 
- private:
   cucascade::shared_data_repository_manager&
     _data_repo_mgr;  ///< Reference to the data repository manager
                      ///< for accessing data during downgrade operations

@@ -39,47 +39,5 @@ downgrade_task* downgrade_executor::cast_to_downgrade_task(itask* task)
   return dynamic_cast<downgrade_task*>(task);
 }
 
-void downgrade_executor::start()
-{
-  bool expected = false;
-  if (!_running.compare_exchange_strong(expected, true)) { return; }
-  on_start();
-  _threads.reserve(_config.num_threads);
-  for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.emplace_back(&downgrade_executor::worker_loop, this, i);
-  }
-}
-
-void downgrade_executor::stop()
-{
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
-  on_stop();
-  for (auto& thread : _threads) {
-    if (thread.joinable()) { thread.join(); }
-  }
-  _threads.clear();
-}
-
-void downgrade_executor::worker_loop(int worker_id)
-{
-  while (true) {
-    if (!_running.load()) {
-      // Executor is stopped.
-      break;
-    }
-    auto task = _task_queue->pull();
-    if (task == nullptr) {
-      // Task queue is closed.
-      break;
-    }
-    try {
-      task->execute(cudf::get_default_stream());
-    } catch (const std::exception& e) {
-      on_task_error(worker_id, std::move(task), e);
-    }
-  }
-}
-
 }  // namespace parallel
 }  // namespace sirius
