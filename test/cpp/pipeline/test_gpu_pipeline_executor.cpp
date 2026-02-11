@@ -15,15 +15,20 @@
  */
 
 #include "catch.hpp"
-#include "exec/channel.hpp"
-#include "exec/config.hpp"
+#include "operator/operator_test_utils.hpp"
+#include "parallel/config.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
-#include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
+
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/mr/device_memory_resource.hpp>
 
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <atomic>
@@ -38,6 +43,52 @@ namespace {
 
 constexpr std::size_t kReservationBytes = 20 * 1024 * 1024;
 constexpr std::size_t kAllocationBytes  = 10 * 1024 * 1024;
+
+// Helper function to create a simple test data batch with two int64 columns
+std::shared_ptr<cucascade::data_batch> create_test_batch(cucascade::memory::memory_space& space,
+                                                         uint64_t batch_id,
+                                                         int64_t start_value,
+                                                         int64_t num_rows)
+{
+  auto mr     = sirius::test::operator_utils::get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+
+  // Create two simple int64 columns
+  std::vector<int64_t> col0_vals(num_rows);
+  std::vector<int64_t> col1_vals(num_rows);
+  for (int64_t i = 0; i < num_rows; ++i) {
+    col0_vals[i] = start_value + i;
+    col1_vals[i] = start_value + i * 2;
+  }
+
+  auto col0 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                        static_cast<cudf::size_type>(num_rows),
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        mr);
+  cudaMemcpy(col0->mutable_view().data<int64_t>(),
+             col0_vals.data(),
+             sizeof(int64_t) * col0_vals.size(),
+             cudaMemcpyHostToDevice);
+
+  auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                        static_cast<cudf::size_type>(num_rows),
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        mr);
+  cudaMemcpy(col1->mutable_view().data<int64_t>(),
+             col1_vals.data(),
+             sizeof(int64_t) * col1_vals.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col0));
+  cols.push_back(std::move(col1));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), space);
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+}
 
 class test_gpu_pipeline_task_global_state
   : public sirius::pipeline::gpu_pipeline_task_global_state {
@@ -134,8 +185,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
 
 }  // namespace
 
-TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
-          "[gpu_pipeline_executor]")
+TEST_CASE("GPU pipeline executor schedules and executes GPU tasks", "[gpu_pipeline_executor]")
 {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   try {
@@ -161,52 +211,38 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
     return;
   }
 
-  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> request_channel;
-  auto request_publisher = request_channel.make_publisher();
-
-  sirius::exec::thread_pool_config config;
+  sirius::parallel::task_executor_config config;
   config.num_threads        = 2;
   config.thread_name_prefix = "gpu-pipeline-test";
 
-  sirius::pipeline::gpu_pipeline_executor executor(config, mem_space, request_publisher);
+  sirius::pipeline::gpu_pipeline_executor executor(config, mem_space);
   auto global_state = std::make_shared<test_gpu_pipeline_task_global_state>();
 
   const int num_tasks = 10;
-  std::atomic<int> dispatched{0};
 
   executor.start();
 
-  std::thread request_handler([&]() {
-    while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
-      auto request = request_channel.get();
-      if (!request) { break; }
+  for (int i = 0; i < num_tasks; ++i) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    batches.push_back(create_test_batch(*mem_space, i, i * 100, 100));
 
-      auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
-        std::vector<std::shared_ptr<cucascade::data_batch>>{});
-      auto task = std::make_unique<sirius_pipeline_task>(
-        static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed)),
-        std::move(local_state),
-        global_state);
-      executor.schedule(std::move(task));
-      dispatched.fetch_add(1, std::memory_order_relaxed);
-    }
-  });
+    auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(std::move(batches));
+    auto task = std::make_unique<sirius_pipeline_task>(i, std::move(local_state), global_state);
+    executor.schedule(std::move(task));
+  }
 
+  // Wait for all tasks to complete
   auto start_time = std::chrono::steady_clock::now();
   auto timeout    = std::chrono::seconds(20);
   while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     if (std::chrono::steady_clock::now() - start_time > timeout) {
       executor.stop();
-      request_channel.close();
-      request_handler.join();
       FAIL("Timed out waiting for GPU pipeline tasks to complete.");
     }
   }
 
   executor.stop();
-  request_channel.close();
-  request_handler.join();
 
   if (global_state->error_count.load(std::memory_order_relaxed) > 0) {
     std::lock_guard<std::mutex> lock(global_state->error_mutex);

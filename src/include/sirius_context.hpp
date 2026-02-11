@@ -20,7 +20,6 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "extension_lock.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "planner/query.hpp"
 #include "sirius_config.hpp"
 #include "sirius_pipeline_hashmap.hpp"
@@ -81,14 +80,11 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
     const;
 
-  [[nodiscard]] sirius::pipeline::pipeline_executor& get_pipeline_executor();
-  [[nodiscard]] const sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
+  [[nodiscard]] sirius::creator::task_creator& get_task_creator();
+  [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
   [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor();
   [[nodiscard]] const sirius::parallel::downgrade_executor& get_downgrade_executor() const;
-
-  [[nodiscard]] sirius::creator::task_creator& get_task_creator();
-  [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
   /// \brief Start a query with its pipeline hashmap.
   /// \param pipeline_hashmap The pipeline hashmap for the query.
@@ -109,9 +105,8 @@ class SiriusContext : public ClientContextState {
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
-  std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
-  std::unique_ptr<sirius::parallel::downgrade_executor> downgrade_executor_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
+  std::unique_ptr<sirius::parallel::downgrade_executor> downgrade_executor_;
   duckdb::shared_ptr<sirius::planner::query> query_;
 };
 

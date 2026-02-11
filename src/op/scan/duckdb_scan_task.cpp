@@ -39,13 +39,13 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  pipeline::pipeline_executor& pipeline_exec,
+  creator::task_creator& task_creator,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
   : _pipeline(std::move(pipeline)),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
-    _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
-    _pipeline_executor(pipeline_exec),
+    _max_threads(task_creator.get_scan_executor().get_num_threads()),
+    _task_creator(task_creator),
     _op(*scan_op)
 {
   // Initialize global table function state
@@ -551,7 +551,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
-    g_state._pipeline_executor.schedule(std::move(next_task));
+    g_state._task_creator.schedule(std::move(next_task));
   }
 
   // Make data batch and push to repository

@@ -19,6 +19,8 @@
 #include "config.hpp"
 #include "task_queue.hpp"
 
+#include <absl/functional/any_invocable.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -49,6 +51,13 @@ class itask_executor {
 
   // Start worker threads
   virtual void start();
+
+  /**
+   * @brief Start worker threads with optional per-thread initialization
+   *
+   * @param per_thread_init Optional callback to run on each thread before starting work loop
+   */
+  virtual void start(absl::AnyInvocable<void() noexcept> per_thread_init);
 
   // Stop accepting new tasks, and join worker threads.
   virtual void stop();

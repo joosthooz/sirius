@@ -18,7 +18,7 @@
 
 #include "config.hpp"
 #include "config_option.hpp"
-#include "exec/config.hpp"
+#include "parallel/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -45,27 +45,26 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
+  [[nodiscard]] const parallel::task_executor_config& get_gpu_pipeline_executor_config()
+    const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
+  [[nodiscard]] const parallel::task_executor_config& get_downgrade_executor_config()
+    const noexcept;
 
-  [[nodiscard]] const exec::thread_pool_config& get_downgrade_executor_config() const noexcept;
-
-  [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
+  [[nodiscard]] const parallel::task_executor_config& get_duckdb_scan_executor_config()
+    const noexcept;
 
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _enable_scan_caching; }
 
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
-  exec::thread_pool_config _task_creator_config{.num_threads        = 2,
-                                                .thread_name_prefix = "task_creator"};
-  exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
-                                                         .thread_name_prefix = "gpu_pipeline"};
-  exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
-                                                      .thread_name_prefix = "downgrade"};
-  exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
-                                                        .thread_name_prefix = "duckdb_scan"};
+  parallel::task_executor_config _gpu_pipeline_executor_config{
+    .num_threads = 4, .thread_name_prefix = "gpu_pipeline"};
+  parallel::task_executor_config _downgrade_executor_config{.num_threads        = 4,
+                                                            .thread_name_prefix = "downgrade"};
+  parallel::task_executor_config _duckdb_scan_executor_config{.num_threads        = 4,
+                                                              .thread_name_prefix = "duckdb_scan"};
   bool _enable_scan_caching = false;
 };
 

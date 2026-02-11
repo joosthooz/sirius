@@ -17,36 +17,37 @@
 #pragma once
 
 #include "duckdb/main/client_context.hpp"
-#include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
-#include "helper/helper.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "parallel/task_executor.hpp"
-#include "pipeline/sirius_pipeline.hpp"
-#include "sirius_pipeline_hashmap.hpp"
+#include "parallel/config.hpp"
+#include "parallel/task.hpp"
+#include "pipeline/completion_handler.hpp"
+#include "planner/query.hpp"
 
-#include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
-#include <condition_variable>
-#include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <thread>
-#include <variant>
+#include <queue>
+#include <unordered_map>
 
 namespace sirius::pipeline {
-class pipeline_executor;
+class gpu_pipeline_executor;
 class gpu_pipeline_task_global_state;
 }  // namespace sirius::pipeline
 
+namespace sirius::op {
+class sirius_physical_duckdb_scan;
+}  // namespace sirius::op
+
 namespace sirius::op::scan {
+class duckdb_scan_executor;
 class duckdb_scan_task_global_state;
 }  // namespace sirius::op::scan
 
@@ -154,34 +155,36 @@ namespace sirius::creator {
  * @brief Manages the creation and scheduling of GPU pipeline tasks.
  *
  * The task_creator is responsible for creating tasks from GPU pipelines and scheduling
- * them for execution. It maintains a thread pool that processes task creation requests
- * from the task_creation_queue. The creator prioritizes table scan pipelines and uses
- * hints from operators to determine the next tasks to create.
+ * them for execution. It uses hints from operators to determine the next tasks to create
+ * and directly schedules them on the appropriate executor (GPU or scan). It also manages
+ * the GPU executors and scan executors.
  *
  * Usage:
- *   1. Construct with a task_creation_queue, thread count, and pipeline map.
- *   2. Call start_thread_pool() to begin processing tasks.
- *   3. Call start() to schedule initial scan pipelines.
- *   4. Call stop_thread_pool() when done.
+ *   1. Construct with executor configurations, memory reservation manager, and optional system
+ * topology.
+ *   2. Call set_client_context().
+ *   3. Call prepare_for_query() to set up for a query.
+ *   4. Call start_query() to begin execution and get a completion future.
+ *   5. Call reset() between queries to clean up state.
  */
-
-struct task_creation_request {
-  op::sirius_physical_operator* node;
-};
-
 class task_creator {
  public:
   /**
    * @brief Construct a new task_creator.
    *
-   * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
-   * @param mem_res_mgr Reference to the memory reservation manager.
+   * @param task_creator_config Configuration for the task creator
+   * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
+   * @param scan_executor_config Configuration for the scan executor thread pool
+   * @param mem_res_mgr Reference to the memory reservation manager
+   * @param sys_topology Optional system topology info for CPU affinity
    */
-  task_creator(exec::thread_pool_config config,
-               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+  task_creator(parallel::task_executor_config gpu_executor_config,
+               parallel::task_executor_config scan_executor_config,
+               memory::sirius_memory_reservation_manager& mem_res_mgr,
+               const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
   /**
-   * @brief Destructor that ensures the thread pool is stopped.
+   * @brief Destructor that ensures executors are stopped.
    */
   virtual ~task_creator();
 
@@ -194,47 +197,26 @@ class task_creator {
   /// \brief sets client context needed for task creation
   void set_client_context(::duckdb::ClientContext& client_context);
 
-  /// \brief sets pipeline executor reference
-  void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor);
-
   /// \brief clean-up query bound resources and prepare the task creator for next query
   void reset();
 
   /**
-   * @brief Stop the task creator and its thread pool.
+   * @brief Schedule a task for the given operator.
+   *
+   * This method directly creates the task and schedules it on the appropriate executor.
+   *
+   * @param node The operator node to schedule a task for.
    */
-  void stop();
+  virtual void schedule(op::sirius_physical_operator* node, int device_id = 0);
 
   /**
-   * @brief Start the worker thread pool.
+   * @brief Schedules a task for execution on the appropriate executor
    *
-   * Creates and starts the worker threads that process task creation requests.
-   * This method is idempotent - calling it multiple times has no additional effect.
-   */
-  void start_thread_pool();
-
-  /**
-   * @brief Stop the worker thread pool.
+   * Routes tasks to either the scan executor or GPU executors based on task type.
    *
-   * Stops all worker threads and waits for them to finish. This method is
-   * idempotent - calling it multiple times has no additional effect.
+   * @param task The task to schedule
    */
-  void stop_thread_pool();
-
-  /**
-   * @brief Drain all pending task creation requests and wait for in-flight tasks to complete.
-   *
-   * Call this after a query completes (future resolved) but before destroying the engine/operators
-   * to ensure no stale operator pointers are accessed by the task creator threads.
-   */
-  void drain_pending_tasks();
-
-  /**
-   * @brief Schedule a task creation info for processing.
-   *
-   * @param info The task creation info to schedule.
-   */
-  virtual void schedule(op::sirius_physical_operator* request);
+  void schedule(std::unique_ptr<parallel::itask> task, int device_id = 0);
 
   /**
    * @brief Get the next task id.
@@ -242,6 +224,35 @@ class task_creator {
    * @return uint64_t The next task id.
    */
   uint64_t get_next_task_id();
+
+  /**
+   * @brief Get the scan executor reference
+   *
+   * @return Reference to the duckdb scan executor
+   */
+  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept;
+
+  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
+
+  /**
+   * @brief Prepare for query execution
+   *
+   * Sets up the scan operators and prepares the executors.
+   *
+   * @param query The query to prepare for
+   */
+  void prepare_for_query(duckdb::shared_ptr<planner::query> query);
+
+  /**
+   * @brief Start query execution and return a future for completion.
+   *
+   * Sets up the completion handler and returns a future that will be satisfied
+   * when the query completes or errors. Note: prepare_for_query must be called
+   * before this method.
+   *
+   * @return A future that will be satisfied when the query completes.
+   */
+  std::future<void> start_query();
 
  protected:
   /**
@@ -256,27 +267,29 @@ class task_creator {
   op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
 
   /**
-   * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
+   * @brief Create and schedule a task for the given operator.
    *
-   * Acquires tickets from the kiosk (ensuring controlled concurrency), pulls task creation
-   * requests from the queue, and schedules work on the thread pool.
+   * @param node The operator node to create a task for.
    */
-  void manager_loop();
+  void create_and_schedule_task(op::sirius_physical_operator* node, int device_id);
 
-  std::atomic<bool> _running;
-  exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
-  std::thread _manager_thread;
+  /**
+   * @brief Schedule the next batch of scan tasks from the priority queue
+   */
+  void schedule_next_scan_tasks();
+
   ::duckdb::ClientContext* _client_context;
-  sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
-  // Queue for creating tasks based on operators. The operator is the starting point to start
-  // looking which task should be created, not necessarily the operator for whose pipeline the task
-  // will be created
-  exec::interruptible_mpmc<std::unique_ptr<task_creation_request>> _task_creation_queue;
+  // Executor management
+  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
+  std::unordered_map<int, std::unique_ptr<pipeline::gpu_pipeline_executor>> _gpu_executors;
+
+  // Query management
+  std::unique_ptr<pipeline::completion_handler> _completion_handler;
+  std::mutex _priority_scans_mutex;
+  std::queue<op::sirius_physical_duckdb_scan*> _priority_scans;
 
   // Map of operator ID to global state for scan operators
   std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>>

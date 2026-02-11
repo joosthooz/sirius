@@ -16,8 +16,8 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
-#include "exec/config.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "parallel/config.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -36,7 +36,6 @@
 #include <vector>
 
 using namespace sirius::creator;
-using namespace sirius::exec;
 using namespace sirius::parallel;
 using namespace sirius::pipeline;
 using namespace sirius::op::scan;
@@ -158,14 +157,14 @@ class testable_task_creator : public task_creator {
   testable_task_creator(int num_threads,
                         sirius_pipeline_hashmap& gpu_pipeline_map,
                         duckdb::ClientContext& client_context,
-                        pipeline_executor& pipeline_executor,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-    : task_creator(
-        exec::thread_pool_config{.num_threads = num_threads, .thread_name_prefix = "task_creator"},
-        mem_res_mgr)
+    : task_creator(parallel::task_executor_config{.num_threads        = num_threads,
+                                                  .thread_name_prefix = "gpu_pipeline_executor"},
+                   parallel::task_executor_config{.num_threads        = num_threads,
+                                                  .thread_name_prefix = "scan_executor"},
+                   mem_res_mgr)
   {
     this->set_client_context(client_context);
-    this->set_pipeline_executor(pipeline_executor);
   }
 
   void schedule(op::sirius_physical_operator* request) override
@@ -244,9 +243,6 @@ class test_fixture {
         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
           std::move(space_configs));
       }()),
-      pipeline_exec(exec::thread_pool_config{.num_threads = 1},
-                    exec::thread_pool_config{.num_threads = 2},
-                    *memory_manager),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {
@@ -265,7 +261,6 @@ class test_fixture {
   sirius_interface sirius_iface;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   sirius_engine engine;
-  pipeline_executor pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
   sirius::sirius_pipeline_hashmap pipeline_map;
 };
@@ -279,7 +274,7 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
   test_fixture fixture;
 
   testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+    2, fixture.pipeline_map, *fixture.con.context, *fixture.memory_manager);
 
   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
 

@@ -29,52 +29,32 @@
 
 namespace sirius::op::scan {
 
-duckdb_scan_executor::duckdb_scan_executor(
-  exec::thread_pool_config config,
-  cucascade::memory::memory_reservation_manager* mem_mgr,
-  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher)
-  : _config(config),
-    _kiosk(_config.num_threads),
-    _task_request_publisher(std::move(task_request_publisher)),
+duckdb_scan_executor::duckdb_scan_executor(parallel::task_executor_config config,
+                                           cucascade::memory::memory_reservation_manager* mem_mgr)
+  : itask_executor(std::make_unique<duckdb_scan_task_queue>(config.num_threads), config),
     _mem_mgr(mem_mgr)
 {
 }
 
-duckdb_scan_executor::~duckdb_scan_executor() { stop(); }
+duckdb_scan_executor::~duckdb_scan_executor() = default;
 
 void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  _task_queue.push(std::move(task));
+  _task_queue->push(std::move(task));
 }
-
-void duckdb_scan_executor::start()
-{
-  bool expected = false;
-  if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
-  _manager_thread = std::thread(&duckdb_scan_executor::manager_loop, this);
-}
-
-void duckdb_scan_executor::stop()
-{
-  bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) { return; }
-  _kiosk.stop();
-  _task_queue.interrupt();
-  if (_thread_pool) { _thread_pool->stop(); }
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _kiosk.wait_all();
-}
-
-void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
 
 void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_creator)
 {
   _task_creator = task_creator;
 }
 
-void duckdb_scan_executor::drain_leftover_tasks() { _task_queue.drain(); }
+void duckdb_scan_executor::drain_leftover_tasks()
+{
+  // Drain the queue by pulling and discarding all tasks
+  while (auto task = _task_queue->pull()) {
+    // Task is discarded
+  }
+}
 
 void duckdb_scan_executor::set_completion_handler(
   sirius::pipeline::completion_handler* handler) noexcept
@@ -128,9 +108,8 @@ void duckdb_scan_executor::prepare_cache_for_scan_operators(
 
 void duckdb_scan_executor::submit_scan_request()
 {
-  // Device ID 0 for scan tasks (CPU-based), is_scan = true
-  [[maybe_unused]] auto result =
-    _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
+  // Note: This method is no longer needed with the new architecture
+  // but kept for potential future use
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_scan_output(
@@ -157,70 +136,69 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_sc
   }
 }
 
-void duckdb_scan_executor::manager_loop()
+void duckdb_scan_executor::worker_loop(int worker_id)
 {
-  while (_running.load()) {
-    auto ticket = _kiosk.acquire();  // block till a thread is available
-    if (!ticket.is_valid()) {
-      SIRIUS_LOG_INFO("DuckDB Scan Executor: Kiosk interrupted, stopping manager loop");
-      break;
-    }
-    auto task = _task_queue.try_pop();
-    if (!task) {
-      if (!_running) {
-        SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
-        break;
-      } else {
-        submit_scan_request();  // tell pipeline executor to submit a scan task request
-        task = _task_queue.pop();
-        if (!task) {
-          SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
-          break;
-        }
-      }
+  while (true) {
+    if (!_running.load()) { break; }
+
+    auto task = _task_queue->pull();
+    if (!task) { break; }
+
+    // Cast to scan task
+    auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get());
+    if (!scan_task) {
+      SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast task to duckdb_scan_task");
+      continue;
     }
 
     // Make host memory reservation and set it on the local state
-    auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get());
     // todo (amin): fix this later, and make the reservation in the executor.
-    if (scan_task and false) {
+    if (scan_task && false) {
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
       if (!reservation) {
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to acquire host memory reservation");
-        break;
+        if (_completion_handler) {
+          _completion_handler->report_error(
+            std::make_exception_ptr(std::runtime_error("Failed to acquire memory reservation")));
+        }
+        continue;
       }
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
             scan_task->local_state())) {
         local_state->set_reservation(std::move(reservation));
       } else {
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
-        break;
+        if (_completion_handler) {
+          _completion_handler->report_error(
+            std::make_exception_ptr(std::runtime_error("Failed to cast local state")));
+        }
+        continue;
       }
     }
 
     auto stream = cudf::get_default_stream();
-    _thread_pool->schedule([this,
-                            ticket    = std::move(ticket),
-                            stream    = std::move(stream),
-                            t         = std::move(task),
-                            scan_task = std::move(scan_task)]() mutable {
-      try {
-        auto consumers = scan_task->get_output_consumers();
-        auto batches   = get_scan_output(scan_task, stream);
-        scan_task->publish_output(std::move(batches), stream);
-        t.reset();
-        if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
-          for (auto* consumer : consumers) {
-            _task_creator->schedule(consumer);
-          }
+
+    try {
+      auto consumers = scan_task->get_output_consumers();
+      auto batches   = get_scan_output(scan_task, stream);
+      scan_task->publish_output(std::move(batches), stream);
+      task.reset();
+      if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
+        for (auto* consumer : consumers) {
+          _task_creator->schedule(consumer);
         }
-      } catch (...) {
-        /// this is fatal error
-        if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
       }
-    });
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("DuckDB Scan Executor: Error executing task: {}", e.what());
+      /// Fatal error
+      if (_completion_handler) { _completion_handler->report_error(std::make_exception_ptr(e)); }
+    } catch (...) {
+      SIRIUS_LOG_ERROR("DuckDB Scan Executor: Unknown error executing task");
+      /// Fatal error
+      if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
+    }
   }
 }
 

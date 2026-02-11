@@ -16,21 +16,16 @@
 
 #pragma once
 
-#include "exec/channel.hpp"
-#include "exec/config.hpp"
-#include "exec/interruptible_mpmc.hpp"
-#include "exec/kiosk.hpp"
-#include "exec/thread_pool.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
-#include "parallel/task.hpp"
+#include "op/scan/duckdb_scan_task_queue.hpp"
+#include "parallel/config.hpp"
+#include "parallel/task_executor.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-#include <atomic>
 #include <memory>
 #include <string>
-#include <thread>
 
 namespace sirius::op {
 class sirius_physical_operator;
@@ -53,22 +48,19 @@ namespace sirius::op::scan {
 /**
  * @brief A task executor for duckdb scan tasks.
  *
- * This class manages a pool of threads dedicated to executing DuckDB scan
- * tasks with kiosk-based concurrency control.
+ * This class inherits from itask_executor and manages threads dedicated to
+ * executing DuckDB scan tasks.
  */
-class duckdb_scan_executor {
+class duckdb_scan_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new duckdb_scan_executor with task execution configuration
    *
-   * @param config Configuration for the thread pool (thread count, etc.)
+   * @param config Configuration for the task executor (thread count, etc.)
    * @param mem_mgr Pointer to the memory reservation manager for host allocations
-   * @param task_request_publisher Publisher to submit task requests
    */
-  explicit duckdb_scan_executor(
-    exec::thread_pool_config config,
-    cucascade::memory::memory_reservation_manager* mem_mgr,
-    exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher);
+  explicit duckdb_scan_executor(parallel::task_executor_config config,
+                                cucascade::memory::memory_reservation_manager* mem_mgr);
 
   /**
    * @brief Destructor for the duckdb_scan_executor.
@@ -86,27 +78,7 @@ class duckdb_scan_executor {
    *
    * @param task The task to be scheduled.
    */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task);
-
-  /**
-   * @brief Starts the executor and initializes worker threads
-   *
-   * Initializes the thread pool and begins accepting tasks for execution.
-   */
-  void start();
-
-  /**
-   * @brief Stops the executor and cleanly shuts down worker threads
-   *
-   * Stops accepting new tasks and waits for all worker threads to complete
-   * their current tasks before shutting down.
-   */
-  void stop();
-
-  /**
-   * @brief Wait for all scheduled tasks to complete.
-   */
-  void wait_all();
+  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
 
   /**
    * @brief Get the number of threads in the thread pool for this executor.
@@ -170,9 +142,11 @@ class duckdb_scan_executor {
 
  private:
   /**
-   * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
+   * @brief Worker loop override for scan-specific task execution
+   *
+   * @param worker_id The ID of the worker thread
    */
-  void manager_loop();
+  void worker_loop(int worker_id) override;
 
   /**
    * @brief Submit a scan task request to pipeline_executor
@@ -193,13 +167,6 @@ class duckdb_scan_executor {
   bool _caching_enabled{false};
   bool _preload_mode{false};
 
-  std::atomic<bool> _running{false};
-  exec::thread_pool_config _config;
-  exec::kiosk _kiosk;
-  std::unique_ptr<exec::thread_pool> _thread_pool;
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
-  std::thread _manager_thread;
-  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   sirius::pipeline::completion_handler* _completion_handler{nullptr};

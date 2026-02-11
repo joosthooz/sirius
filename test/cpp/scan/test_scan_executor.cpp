@@ -21,11 +21,9 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <exec/config.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 #include <op/sirius_physical_table_scan.hpp>
-#include <pipeline/pipeline_executor.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
@@ -340,8 +338,8 @@ static void run_scan_test(std::string const& table_name,
   REQUIRE(physical_scan);
 
   // Get pipeline executor from sirius context (owns the scan executor)
-  auto& pipeline_executor = sirius_ctx->get_pipeline_executor();
-  auto& scan_executor     = pipeline_executor.get_scan_executor();
+  auto& task_creator  = sirius_ctx->get_task_creator();
+  auto& scan_executor = task_creator.get_scan_executor();
 
   // Create execution context using dummy query
   auto dummy_query = "SELECT * FROM " + table_name + " LIMIT 0";
@@ -354,7 +352,7 @@ static void run_scan_test(std::string const& table_name,
 
   // Create global state
   auto global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-    nullptr, pipeline_executor, client_ctx, physical_scan.get());
+    nullptr, task_creator, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
   cucascade::shared_data_repository data_repo;
@@ -366,19 +364,18 @@ static void run_scan_test(std::string const& table_name,
 
   // Run tasks
   const auto scan_start = std::chrono::steady_clock::now();
-  pipeline_executor.start();
+  task_creator.start_query();
   for (int i = 0; i < scan_executor.get_num_threads(); ++i) {
     auto local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
       *global_state, *execution_context, batch_size);
     auto task = std::make_unique<op::scan::duckdb_scan_task>(
       static_cast<uint64_t>(i + 1), &data_repo, std::move(local_state), global_state);
-    pipeline_executor.schedule(std::move(task));
+    task_creator.schedule(std::move(task));
   }
   while (!global_state->is_source_drained()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  pipeline_executor.stop();
   const auto scan_end = std::chrono::steady_clock::now();
   const auto elapsed_ms =
     std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - scan_start).count();

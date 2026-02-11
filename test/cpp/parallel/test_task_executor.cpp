@@ -119,7 +119,7 @@ class dummy_task_executor : public itask_executor {
 TEST_CASE("Executor can start and stop gracefully", "[task_executor]")
 {
   auto queue = std::make_unique<dummy_task_queue>();
-  task_executor_config config{4, false};
+  task_executor_config config{4, "test_task_executor", false};
   dummy_task_executor executor(std::move(queue), config);
 
   REQUIRE_NOTHROW(executor.start());
@@ -130,7 +130,7 @@ TEST_CASE("Executor executes scheduled tasks", "[task_executor]")
 {
   auto queue = std::make_unique<dummy_task_queue>();
   auto g     = std::make_shared<dummy_task_global_state>();
-  task_executor_config config{4, false};
+  task_executor_config config{4, "test_task_executor", false};
   dummy_task_executor executor(std::move(queue), config);
   REQUIRE_NOTHROW(executor.start());
 

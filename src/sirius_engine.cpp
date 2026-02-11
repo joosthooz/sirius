@@ -169,7 +169,7 @@ void sirius_engine::execute()
   // Create the query with the pipeline hashmap
   sirius_pipeline_hashmap pipeline_map(new_scheduled);
   sirius_ctx->create_query(std::move(pipeline_map));
-  auto future = sirius_ctx->get_pipeline_executor().start_query();
+  auto future = sirius_ctx->get_task_creator().start_query();
   try {
     future.get();
   } catch (const std::exception& e) {
