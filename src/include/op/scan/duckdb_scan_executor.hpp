@@ -17,10 +17,8 @@
 #pragma once
 
 #include "op/scan/duckdb_scan_task.hpp"
-#include "op/scan/duckdb_scan_task_queue.hpp"
 #include "parallel/config.hpp"
 #include "parallel/task_executor.hpp"
-#include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -93,13 +91,6 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
    * @param task_creator Pointer to the task creator
    */
   void set_task_creator(sirius::creator::task_creator* task_creator);
-
-  /**
-   * @brief Drain any leftover tasks from the queue
-   *
-   * Clears the task queue of any remaining tasks from a previous query.
-   */
-  void drain_leftover_tasks();
 
   /**
    * @brief Set the completion handler for query completion signaling

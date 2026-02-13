@@ -65,13 +65,9 @@ task_creator::task_creator(parallel::task_executor_config gpu_executor_config,
     _gpu_executors.emplace(device_id,
                            std::make_unique<pipeline::gpu_pipeline_executor>(
                              config, const_cast<cucascade::memory::memory_space*>(space)));
+    _gpu_executors.at(device_id)->set_task_creator(this);
   }
-
-  // Set task creator reference on executors
   _scan_executor->set_task_creator(this);
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_task_creator(this);
-  }
 }
 
 task_creator::~task_creator() = default;
@@ -107,12 +103,11 @@ void task_creator::reset()
 
 void task_creator::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
-  // Drain leftover tasks from previous query
-  _scan_executor->drain_leftover_tasks();
+  // start() calls open() on the task queue, which also removes any leftover tasks
+  _scan_executor->start();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_leftover_tasks();
+    gpu_exec->start();
   }
-
   auto scans = query->get_scan_operators();
   _scan_executor->prepare_cache_for_scan_operators(scans);
 

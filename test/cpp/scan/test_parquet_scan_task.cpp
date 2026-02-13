@@ -238,7 +238,8 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   cucascade::shared_data_repository data_repo;
 
-  sirius::parallel::task_executor_config executor_config{num_threads, false};
+  sirius::parallel::task_executor_config executor_config{
+    num_threads, "test_parquet_scan_task", false};
   auto task_queue =
     std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
   sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));

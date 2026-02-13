@@ -48,14 +48,6 @@ void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_
   _task_creator = task_creator;
 }
 
-void duckdb_scan_executor::drain_leftover_tasks()
-{
-  // Drain the queue by pulling and discarding all tasks
-  while (auto task = _task_queue->pull()) {
-    // Task is discarded
-  }
-}
-
 void duckdb_scan_executor::set_completion_handler(
   sirius::pipeline::completion_handler* handler) noexcept
 {
