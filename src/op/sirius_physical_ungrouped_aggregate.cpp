@@ -200,98 +200,102 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref memory_resource)
 {
-  auto sum_agg     = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-  auto sum_type    = ToCudfType(return_type);
+  auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+  // Reduce the sum column using its own type (cudf requires output type == input type
+  // for fixed-point reductions). The final AVG return type is applied after division.
+  auto sum_type    = sum_view.type();
   auto sum_value   = cudf::reduce(sum_view, *sum_agg, sum_type, stream, memory_resource);
   auto count_value = cudf::reduce(
     count_view, *sum_agg, cudf::data_type(cudf::type_id::INT64), stream, memory_resource);
 
   auto const count_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*count_value).value();
-  std::unique_ptr<cudf::scalar> out_scalar;
-  if (return_type.id() == duckdb::LogicalTypeId::DECIMAL) {
-    auto scale           = duckdb::DecimalType::GetScale(return_type);
-    auto width           = duckdb::DecimalType::GetWidth(return_type);
-    auto scale_type      = numeric::scale_type{-scale};
-    auto denom           = std::pow(10.0L, static_cast<long double>(scale));
-    long double sum_host = 0.0L;
+
+  // Step 1: Extract the sum value as long double, regardless of the source type.
+  // The sum column type may differ from the return type (e.g., sum is DECIMAL64 but
+  // DuckDB's avg return type is DOUBLE).
+  long double sum_host = 0.0L;
+  bool sum_is_decimal =
+    (sum_type.id() == cudf::type_id::DECIMAL32 || sum_type.id() == cudf::type_id::DECIMAL64 ||
+     sum_type.id() == cudf::type_id::DECIMAL128);
+  if (sum_is_decimal) {
+    auto denom = std::pow(10.0L, static_cast<long double>(-sum_type.scale()));
     switch (sum_type.id()) {
       case cudf::type_id::DECIMAL32: {
-        auto& sum_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(*sum_value);
-        sum_host         = static_cast<long double>(sum_scalar.value(stream)) / denom;
+        auto& s  = static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(*sum_value);
+        sum_host = static_cast<long double>(s.value(stream)) / denom;
         break;
       }
       case cudf::type_id::DECIMAL64: {
-        auto& sum_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(*sum_value);
-        sum_host         = static_cast<long double>(sum_scalar.value(stream)) / denom;
+        auto& s  = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(*sum_value);
+        sum_host = static_cast<long double>(s.value(stream)) / denom;
         break;
       }
       case cudf::type_id::DECIMAL128: {
-        auto& sum_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal128>&>(*sum_value);
-        sum_host         = static_cast<long double>(sum_scalar.value(stream)) / denom;
+        auto& s  = static_cast<cudf::fixed_point_scalar<numeric::decimal128>&>(*sum_value);
+        sum_host = static_cast<long double>(s.value(stream)) / denom;
         break;
       }
-      default: throw duckdb::NotImplementedException("AVG decimal sum type not supported");
-    }
-    long double avg_host = (count_host == 0) ? 0.0L : (sum_host / count_host);
-    long double scaled   = avg_host * denom;
-    if (width <= duckdb::Decimal::MAX_WIDTH_INT32) {
-      auto rep   = static_cast<int32_t>(std::llround(scaled));
-      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-        rep, scale_type, true, stream, memory_resource);
-    } else if (width <= duckdb::Decimal::MAX_WIDTH_INT64) {
-      auto rep   = static_cast<int64_t>(std::llround(scaled));
-      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-        rep, scale_type, true, stream, memory_resource);
-    } else {
-      auto rep   = static_cast<__int128_t>(std::llround(scaled));
-      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-        rep, scale_type, true, stream, memory_resource);
+      default: break;
     }
   } else {
-    if (count_host == 0) {
-      switch (sum_type.id()) {
-        case cudf::type_id::FLOAT32:
-          out_scalar = make_numeric_scalar_with_value<float>(sum_type, 0.0f, stream);
-          break;
-        case cudf::type_id::FLOAT64:
-          out_scalar = make_numeric_scalar_with_value<double>(sum_type, 0.0, stream);
-          break;
-        case cudf::type_id::INT32:
-          out_scalar = make_numeric_scalar_with_value<int32_t>(sum_type, 0, stream);
-          break;
-        case cudf::type_id::INT64:
-          out_scalar = make_numeric_scalar_with_value<int64_t>(sum_type, 0, stream);
-          break;
-        default: throw duckdb::NotImplementedException("AVG output type not supported");
-      }
+    switch (sum_type.id()) {
+      case cudf::type_id::FLOAT32:
+        sum_host = scalar_cast<cudf::numeric_scalar<float>>(*sum_value).value();
+        break;
+      case cudf::type_id::FLOAT64:
+        sum_host = scalar_cast<cudf::numeric_scalar<double>>(*sum_value).value();
+        break;
+      case cudf::type_id::INT32:
+        sum_host = scalar_cast<cudf::numeric_scalar<int32_t>>(*sum_value).value();
+        break;
+      case cudf::type_id::INT64:
+        sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
+        break;
+      default: throw duckdb::NotImplementedException("AVG: unsupported sum column type");
+    }
+  }
+
+  // Step 2: Compute avg and produce the output scalar in the DuckDB return type.
+  long double avg_host = (count_host == 0) ? 0.0L : (sum_host / count_host);
+  std::unique_ptr<cudf::scalar> out_scalar;
+
+  if (return_type.id() == duckdb::LogicalTypeId::DECIMAL) {
+    auto scale         = duckdb::DecimalType::GetScale(return_type);
+    auto width         = duckdb::DecimalType::GetWidth(return_type);
+    auto scale_type    = numeric::scale_type{-scale};
+    auto denom         = std::pow(10.0L, static_cast<long double>(scale));
+    long double scaled = avg_host * denom;
+    if (width <= duckdb::Decimal::MAX_WIDTH_INT32) {
+      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        static_cast<int32_t>(std::llround(scaled)), scale_type, true, stream, memory_resource);
+    } else if (width <= duckdb::Decimal::MAX_WIDTH_INT64) {
+      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        static_cast<int64_t>(std::llround(scaled)), scale_type, true, stream, memory_resource);
     } else {
-      switch (sum_type.id()) {
-        case cudf::type_id::FLOAT32: {
-          auto sum_host = scalar_cast<cudf::numeric_scalar<float>>(*sum_value).value();
-          out_scalar =
-            make_numeric_scalar_with_value<float>(sum_type, sum_host / count_host, stream);
-          break;
-        }
-        case cudf::type_id::FLOAT64: {
-          auto sum_host = scalar_cast<cudf::numeric_scalar<double>>(*sum_value).value();
-          out_scalar =
-            make_numeric_scalar_with_value<double>(sum_type, sum_host / count_host, stream);
-          break;
-        }
-        case cudf::type_id::INT32: {
-          auto sum_host = scalar_cast<cudf::numeric_scalar<int32_t>>(*sum_value).value();
-          out_scalar    = make_numeric_scalar_with_value<int32_t>(
-            sum_type, static_cast<int32_t>(sum_host / count_host), stream);
-          break;
-        }
-        case cudf::type_id::INT64: {
-          auto sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
-          out_scalar    = make_numeric_scalar_with_value<int64_t>(
-            sum_type, static_cast<int64_t>(sum_host / count_host), stream);
-          break;
-        }
-        default: throw duckdb::NotImplementedException("AVG output type not supported");
-      }
+      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+        static_cast<__int128_t>(std::llround(scaled)), scale_type, true, stream, memory_resource);
+    }
+  } else {
+    // Non-decimal return type (typically DOUBLE)
+    auto out_cudf_type = ToCudfType(return_type);
+    switch (out_cudf_type.id()) {
+      case cudf::type_id::FLOAT64:
+        out_scalar = make_numeric_scalar_with_value<double>(
+          out_cudf_type, static_cast<double>(avg_host), stream);
+        break;
+      case cudf::type_id::FLOAT32:
+        out_scalar = make_numeric_scalar_with_value<float>(
+          out_cudf_type, static_cast<float>(avg_host), stream);
+        break;
+      case cudf::type_id::INT64:
+        out_scalar = make_numeric_scalar_with_value<int64_t>(
+          out_cudf_type, static_cast<int64_t>(avg_host), stream);
+        break;
+      case cudf::type_id::INT32:
+        out_scalar = make_numeric_scalar_with_value<int32_t>(
+          out_cudf_type, static_cast<int32_t>(avg_host), stream);
+        break;
+      default: throw duckdb::NotImplementedException("AVG: unsupported return type");
     }
   }
 
@@ -300,11 +304,13 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 
 }  // namespace
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_aggregate::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_ungrouped_aggregate::execute(const operator_data& input_data,
+                                                           rmm::cuda_stream_view stream)
 {
-  if (aggregates.empty()) { return {}; }
+  const auto& input_batches = input_data.get_data_batches();
+  if (aggregates.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   auto layout = build_aggregate_layout(aggregates);
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
@@ -351,6 +357,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
           } else {
             agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
           }
+          // For AVG, the SUM reduction must use the input column type (cudf requires
+          // output type == input type for fixed-point reductions). The final AVG return
+          // type is applied later in the merge step when dividing SUM / COUNT.
+          if (spec.kind == aggregate_kind::AVG) { out_type = col.type(); }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
@@ -370,7 +380,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
-  return outputs;
+  return operator_data(outputs);
 }
 
 // Helper to deep copy Expression vector (same as in grouped_aggregate)
@@ -412,22 +422,27 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
     duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>>
-sirius_physical_ungrouped_aggregate_merge::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_ungrouped_aggregate_merge::execute(const operator_data& input_data,
+                                                                 rmm::cuda_stream_view stream)
 {
-  if (aggregates.empty()) { return {}; }
+  const auto& input_batches = input_data.get_data_batches();
+  if (aggregates.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
     if (batch) { valid_batches.push_back(batch); }
   }
-  if (valid_batches.empty()) { return {}; }
+  if (valid_batches.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
@@ -438,7 +453,10 @@ sirius_physical_ungrouped_aggregate_merge::execute(
       gpu_merge_impl::merge_ungrouped_aggregate(valid_batches, layout.merge_kinds, stream, *space);
   }
 
-  if (!layout.has_avg) { return {std::move(merged_batch)}; }
+  if (!layout.has_avg) {
+    return operator_data(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
+  }
 
   auto merged_table =
     merged_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
@@ -465,7 +483,8 @@ sirius_physical_ungrouped_aggregate_merge::execute(
   auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
-  return {std::move(output_batch)};
+  return operator_data(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 
 }  // namespace op

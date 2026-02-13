@@ -99,5 +99,11 @@ void sirius_physical_column_data_scan::build_pipelines(
   state.set_pipeline_source(current, *this);
 }
 
+operator_data sirius_physical_column_data_scan::execute(const operator_data& input_data,
+                                                        rmm::cuda_stream_view stream)
+{
+  return input_data;
+}
+
 }  // namespace op
 }  // namespace sirius

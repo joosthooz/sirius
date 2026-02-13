@@ -25,6 +25,7 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
@@ -44,6 +45,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
                                           std::vector<int> group_idx,
                                           std::vector<cudf::aggregation::Kind> cudf_aggregates,
                                           std::vector<int> cudf_aggregate_idx,
+                                          std::vector<AggregateSlot> aggregate_slots,
+                                          bool has_avg,
                                           duckdb::idx_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
@@ -88,6 +91,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
 
+  // AVG decomposition metadata
+  std::vector<AggregateSlot> aggregate_slots;
+  bool has_avg = false;
+
   std::size_t current_partition_index = 0;
 
  public:
@@ -104,12 +111,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
-  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch()
-    override;
+  std::optional<operator_data> get_next_task_input_data() override;
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

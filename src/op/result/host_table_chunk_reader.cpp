@@ -23,21 +23,26 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 // duckdb
+#include <duckdb/common/types/decimal.hpp>
+#include <duckdb/common/vector_operations/vector_operations.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/main/client_context.hpp>
 
 // standard library
 #include <algorithm>
-#include <cstring>
-#include <vector>
 
 namespace sirius::op::result {
 
 host_table_chunk_reader::column_reader::column_reader(
   metadata_node const& node, std::unique_ptr<multiple_blocks_allocation> const& allocation)
 {
-  size       = static_cast<size_t>(node.size);
-  null_count = static_cast<size_t>(node.null_count);
+  if (allocation == nullptr || allocation->block_size() == 0) {
+    throw std::runtime_error(
+      "[host_table_chunk_reader::column_reader::column_reader] Invalid allocation.");
+  }
+  size          = static_cast<size_t>(node.size);
+  null_count    = static_cast<size_t>(node.null_count);
+  cudf_col_type = node.type;
   if (node.null_mask_offset < 0) { null_count = 0; }
 
   data_accessor.initialize(static_cast<size_t>(node.data_offset), allocation);
@@ -90,7 +95,9 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   // We are copying into a flat vector
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 
-  // Do the data copy
+  // Do the data copy — the vector's physical type must match the source data element size.
+  // Type widening (when cudf type is narrower than DuckDB type) is handled in get_next_chunk()
+  // by copying into a temp vector and using DuckDB's cast.
   auto const type_size =
     static_cast<size_t>(duckdb::GetTypeIdSize(vector.GetType().InternalType()));
   auto* dest_ptr = duckdb::FlatVector::GetData(vector);
@@ -181,10 +188,14 @@ void host_table_chunk_reader::column_reader::copy_string(
     if (null_count != 0) {
       auto& validity = duckdb::FlatVector::Validity(vector);
       copy_mask_to_validity(validity, row_offset, count, allocation);
+      detail::make_duckdb_strings<true, int64_t>(
+        offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
+    } else {
+      detail::make_duckdb_strings<false, int64_t>(
+        offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
-    detail::make_duckdb_strings<false>(
-      offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-    duckdb::StringVector::AddBuffer(vector, str_buffer);
   } else {
     // INT32 offsets (from scan task)
     auto start_offset = static_cast<size_t>(offset_accessor_32.get_current(allocation));
@@ -197,10 +208,14 @@ void host_table_chunk_reader::column_reader::copy_string(
     if (null_count != 0) {
       auto& validity = duckdb::FlatVector::Validity(vector);
       copy_mask_to_validity(validity, row_offset, count, allocation);
+      detail::make_duckdb_strings<true, int32_t>(
+        offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
+    } else {
+      detail::make_duckdb_strings<false, int32_t>(
+        offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
-    detail::make_duckdb_strings<false>(
-      offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-    duckdb::StringVector::AddBuffer(vector, str_buffer);
   }
 }
 
@@ -224,7 +239,19 @@ host_table_chunk_reader::host_table_chunk_reader(
     throw std::runtime_error(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
+  if (_allocation->size_bytes() == 0) {
+    if (metadata_nodes[0].size == 0) {
+      // Empty result host table, return without any column readers (creating them would fail).
+      // Because _row_offset and _total_rows are 0 by default, get_next_chunk() will immediately
+      // return false.
+      return;
+    } else {
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] host_table has rows but a zero-sized allocation");
+    }
+  }
   // Initialize column readers
+  _column_readers.reserve(metadata_nodes.size());
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
     if (col_idx == 0) {
       _total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);
@@ -242,6 +269,34 @@ host_table_chunk_reader::host_table_chunk_reader(
         "[host_table_chunk_reader] HUGEINT type is not currently supported.");
     }
     _column_readers.emplace_back(metadata_nodes[col_idx], _allocation);
+  }
+}
+
+/// Map a cudf data_type to the DuckDB LogicalType with the same physical storage size.
+/// Used to create temp vectors for type-widening casts.
+static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
+{
+  switch (type.id()) {
+    case cudf::type_id::INT8: return duckdb::LogicalType::TINYINT;
+    case cudf::type_id::INT16: return duckdb::LogicalType::SMALLINT;
+    case cudf::type_id::INT32: return duckdb::LogicalType::INTEGER;
+    case cudf::type_id::INT64: return duckdb::LogicalType::BIGINT;
+    case cudf::type_id::UINT8: return duckdb::LogicalType::UTINYINT;
+    case cudf::type_id::UINT16: return duckdb::LogicalType::USMALLINT;
+    case cudf::type_id::UINT32: return duckdb::LogicalType::UINTEGER;
+    case cudf::type_id::UINT64: return duckdb::LogicalType::UBIGINT;
+    case cudf::type_id::FLOAT32: return duckdb::LogicalType::FLOAT;
+    case cudf::type_id::FLOAT64: return duckdb::LogicalType::DOUBLE;
+    case cudf::type_id::DECIMAL32:
+      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT32,
+                                          static_cast<uint8_t>(-type.scale()));
+    case cudf::type_id::DECIMAL64:
+      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT64,
+                                          static_cast<uint8_t>(-type.scale()));
+    case cudf::type_id::DECIMAL128:
+      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT128,
+                                          static_cast<uint8_t>(-type.scale()));
+    default: return duckdb::LogicalType::SQLNULL;
   }
 }
 
@@ -263,7 +318,17 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
     if (vec.GetType().InternalType() == duckdb::PhysicalType::VARCHAR) {
       _column_readers[col_idx].copy_string(vec, _row_offset, count, _allocation);
     } else {
-      _column_readers[col_idx].copy_fixed_width(vec, _row_offset, count, _allocation);
+      auto src_duckdb_type = cudf_type_to_duckdb(_column_readers[col_idx].cudf_col_type);
+      if (src_duckdb_type.id() == duckdb::LogicalTypeId::SQLNULL ||
+          src_duckdb_type.InternalType() == vec.GetType().InternalType()) {
+        // Physical sizes match (or unknown source type): direct copy
+        _column_readers[col_idx].copy_fixed_width(vec, _row_offset, count, _allocation);
+      } else {
+        // Type size mismatch: copy into a temp vector at the cudf native size, then cast
+        duckdb::Vector temp_vec(src_duckdb_type);
+        _column_readers[col_idx].copy_fixed_width(temp_vec, _row_offset, count, _allocation);
+        duckdb::VectorOperations::Cast(_client_ctx, temp_vec, vec, count);
+      }
     }
   }
 

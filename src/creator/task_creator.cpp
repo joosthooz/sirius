@@ -252,8 +252,8 @@ void task_creator::create_and_schedule_task(op::sirius_physical_operator* node, 
   } else {
     // need to exhaust input batches until all ports are empty
     while (!node->all_ports_empty()) {
-      auto input_batch = node->get_next_task_input_batch();
-      if (!input_batch.has_value()) { break; }
+      auto input_data = node->get_next_task_input_data();
+      if (!input_data.has_value()) { break; }
       pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
                                       // task creation
 
@@ -271,7 +271,7 @@ void task_creator::create_and_schedule_task(op::sirius_physical_operator* node, 
       }
 
       auto local_state =
-        std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch.value());
+        std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_data.value());
       auto task =
         std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
                                                       destination_data_repositories,

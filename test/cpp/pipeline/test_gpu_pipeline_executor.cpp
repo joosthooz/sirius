@@ -226,7 +226,8 @@ TEST_CASE("GPU pipeline executor schedules and executes GPU tasks", "[gpu_pipeli
     std::vector<std::shared_ptr<cucascade::data_batch>> batches;
     batches.push_back(create_test_batch(*mem_space, i, i * 100, 100));
 
-    auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(std::move(batches));
+    auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
+      sirius::op::operator_data(std::move(batches)));
     auto task = std::make_unique<sirius_pipeline_task>(i, std::move(local_state), global_state);
     executor.schedule(std::move(task));
   }
