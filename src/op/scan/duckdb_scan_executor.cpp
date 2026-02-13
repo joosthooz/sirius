@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "parallel/task_queue.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
@@ -31,7 +32,7 @@ namespace sirius::op::scan {
 
 duckdb_scan_executor::duckdb_scan_executor(parallel::task_executor_config config,
                                            cucascade::memory::memory_reservation_manager* mem_mgr)
-  : itask_executor(std::make_unique<duckdb_scan_task_queue>(config.num_threads), config),
+  : itask_executor(std::make_unique<parallel::task_queue>(config.num_threads), config),
     _mem_mgr(mem_mgr)
 {
 }

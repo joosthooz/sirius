@@ -22,8 +22,8 @@
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "parallel/task_queue.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/gpu_pipeline_queue.hpp"
 
 #include <rmm/cuda_device.hpp>
 
@@ -34,7 +34,7 @@ namespace pipeline {
 
 gpu_pipeline_executor::gpu_pipeline_executor(const parallel::task_executor_config& config,
                                              cucascade::memory::memory_space* mem_space)
-  : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), config),
+  : itask_executor(std::make_unique<parallel::task_queue>(config.num_threads), config),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _memory_space(mem_space)
 {

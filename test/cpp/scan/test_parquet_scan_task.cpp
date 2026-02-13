@@ -20,10 +20,10 @@
 #include <utils/utils.hpp>
 
 // sirius
-#include <op/scan/duckdb_scan_task_queue.hpp>
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
+#include <parallel/task_queue.hpp>
 #include <pipeline/sirius_pipeline_itask_local_state.hpp>
 
 // cucascade
@@ -240,8 +240,7 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   sirius::parallel::task_executor_config executor_config{
     num_threads, "test_parquet_scan_task", false};
-  auto task_queue =
-    std::make_unique<sirius::op::scan::duckdb_scan_task_queue>(executor_config.num_threads);
+  auto task_queue = std::make_unique<sirius::parallel::task_queue>(executor_config.num_threads);
   sirius::parallel::itask_executor executor(std::move(task_queue), std::move(executor_config));
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
