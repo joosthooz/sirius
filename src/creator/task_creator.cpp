@@ -237,6 +237,8 @@ void task_creator::manager_loop()
         }
       });
   }
+  stop_thread_pool();
+  _pipeline_executor->stop();
 }
 
 uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }

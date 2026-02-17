@@ -29,6 +29,8 @@
 
 #include <util/stream_check_wrapper.hpp>
 
+#include <exception>
+
 namespace sirius {
 namespace pipeline {
 
@@ -68,6 +70,8 @@ void gpu_pipeline_executor::start()
 
 void gpu_pipeline_executor::stop()
 {
+  _completion_handler->report_error(
+    std::make_exception_ptr(std::runtime_error("Pipeline executor stopped")));
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _kiosk.stop();
@@ -152,6 +156,7 @@ void gpu_pipeline_executor::manager_loop()
       if (query_complete && _completion_handler) { _completion_handler->mark_completed(); }
     });
   }
+  stop();
 }
 
 gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::parallel::itask* task)
