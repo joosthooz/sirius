@@ -446,8 +446,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       left_indices  = std::move(join_result.first);
       right_indices = std::move(join_result.second);
     }
+    // For SEMI/RIGHT_SEMI: if the plan requests right columns, output only those (no left columns).
+    // Otherwise output only left columns (classic SEMI: probe side only).
     if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI) {
-      collect_right = false;
+      if (rhs_output_columns.col_idxs.empty()) {
+        collect_right = false;
+      } else {
+        collect_left = false;
+      }
     }
 
     cudf::out_of_bounds_policy left_out_of_bounds_policy  = cudf::out_of_bounds_policy::DONT_CHECK;
