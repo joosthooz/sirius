@@ -26,6 +26,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "utils.hpp"
 
 #include <cudf/table/table.hpp>
@@ -79,7 +80,13 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
+  SIRIUS_LOG_DEBUG("Table scan names: {}", fmt::join(names, ", "));
+  SIRIUS_LOG_DEBUG("Table scan columns:");
+  for (const auto& id : column_ids) {
+    SIRIUS_LOG_DEBUG("Column id: {} type {}",
+                     id.GetPrimaryIndex(),
+                     cudf::type_to_name(GetCudfType(returned_types[id.GetPrimaryIndex()])));
+  }
 }
 
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
@@ -138,6 +145,12 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (table_filters) {
     filter_expr = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, projection_ids);
+    SIRIUS_LOG_DEBUG(
+      "Pipeline {}: sirius_physical_table_scan converted table filters to expression: {}, return "
+      "type: {}",
+      this->get_pipeline()->get_pipeline_id(),
+      filter_expr->ToString(),
+      filter_expr->return_type.ToString());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
@@ -190,6 +203,10 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       std::vector<std::unique_ptr<cudf::column>> selected;
       selected.reserve(expected_output_columns);
       for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
+        SIRIUS_LOG_DEBUG("Pipeline {}: Projected column {}: type {}",
+                         this->get_pipeline()->get_pipeline_id(),
+                         projection_ids[i],
+                         cudf::type_to_name(columns[projection_ids[i]]->type()));
         selected.push_back(std::move(columns[projection_ids[i]]));
       }
 
@@ -208,7 +225,20 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
+
+  auto& input_data_rep = output_batches[0]->get_data()->cast<cucascade::gpu_table_representation>();
+  auto input_table     = input_data_rep.get_table().view();
+  for (size_t i = 0; i < input_table.num_columns(); ++i) {
+    const auto& col = input_table.column(i);
+    SIRIUS_LOG_DEBUG("Pipeline {}: Output column {}: type {}",
+                     this->get_pipeline()->get_pipeline_id(),
+                     i,
+                     cudf::type_to_name(col.type()));
+  }
+
+  SIRIUS_LOG_DEBUG("Pipeline {}: Scan time: {:.2f} ms",
+                   this->get_pipeline()->get_pipeline_id(),
+                   duration.count() / 1000.0);
   return std::make_unique<operator_data>(output_batches);
 }
 

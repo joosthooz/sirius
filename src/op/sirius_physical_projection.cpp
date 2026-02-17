@@ -25,6 +25,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <chrono>
 
@@ -45,7 +46,11 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
-  SIRIUS_LOG_DEBUG("Executing projection");
+  SIRIUS_LOG_DEBUG("Executing projection (pipeline {})", this->get_pipeline()->get_pipeline_id());
+  for (auto const& expr : select_list) {
+    SIRIUS_LOG_DEBUG("Projection Expression: {}", expr->ToString());
+  }
+
   auto start = std::chrono::high_resolution_clock::now();
 
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);

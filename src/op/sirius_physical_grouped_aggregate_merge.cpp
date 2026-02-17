@@ -20,9 +20,11 @@
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 namespace sirius {
 namespace op {
@@ -188,6 +190,23 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
+  // Log input column types (first batch) and expected output types (from plan)
+  {
+    cudf::table_view input_view = sirius::get_cudf_table_view(*input_batches[0]);
+    for (cudf::size_type c = 0; c < input_view.num_columns(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Grouped aggregate merge input  col[{}]: {}",
+                       this->get_pipeline()->get_pipeline_id(),
+                       c,
+                       cudf::type_to_name(input_view.column(c).type()));
+    }
+    for (duckdb::idx_t c = 0; c < this->types.size(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Grouped aggregate merge expected output col[{}]: {}",
+                       this->get_pipeline()->get_pipeline_id(),
+                       c,
+                       this->types[c].ToString());
+    }
+  }
+
   // Fast path: single batch with no AVG needs no processing
   if (input_batches.size() == 1 && !has_avg) { return std::make_unique<operator_data>(input_data); }
 
@@ -205,6 +224,13 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // If no AVG, return merged result directly
   if (!has_avg) {
+    cudf::table_view out_view = sirius::get_cudf_table_view(*merged);
+    for (cudf::size_type c = 0; c < out_view.num_columns(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Grouped aggregate merge output col[{}]: {}",
+                       this->get_pipeline()->get_pipeline_id(),
+                       c,
+                       cudf::type_to_name(out_view.column(c).type()));
+    }
     return std::make_unique<operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
@@ -263,7 +289,16 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space);
+  {
+    cudf::table_view out_view = output_table->view();
+    for (cudf::size_type c = 0; c < out_view.num_columns(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Grouped aggregate merge output col[{}]: {}",
+                       this->get_pipeline()->get_pipeline_id(),
+                       c,
+                       cudf::type_to_name(out_view.column(c).type()));
+    }
+  }
+  auto result = sirius::make_data_batch(std::move(output_table), *space);
   return std::make_unique<operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }

@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_delim_join.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "log/logging.hpp"
@@ -25,6 +26,8 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+
+#include <cudf/utilities/type_dispatcher.hpp>
 
 namespace sirius {
 namespace op {
@@ -155,43 +158,121 @@ void sirius_physical_right_delim_join::build_pipelines(
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  const auto& batches = input_data.get_data_batches();
+  if (!batches.empty() && batches[0] && batches[0]->get_data()) {
+    auto pipeline_id            = get_pipeline() ? get_pipeline()->get_pipeline_id() : 0u;
+    cudf::table_view input_view = sirius::get_cudf_table_view(*batches[0]);
+    for (cudf::size_type c = 0; c < input_view.num_columns(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Right delim join input  col[{}]: {}",
+                       pipeline_id,
+                       c,
+                       cudf::type_to_name(input_view.column(c).type()));
+    }
+    for (duckdb::idx_t c = 0; c < types.size(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Right delim join expected output col[{}]: {}",
+                       pipeline_id,
+                       c,
+                       types[c].ToString());
+    }
+    SIRIUS_LOG_DEBUG("Pipeline {}: Right delim join output (pass-through, same as input)",
+                     pipeline_id);
+  }
   return std::make_unique<operator_data>(input_data);
 }
 
 void sirius_physical_right_delim_join::sink(const operator_data& input_data,
                                             rmm::cuda_stream_view stream)
 {
+  auto pipeline_id      = get_pipeline() ? get_pipeline()->get_pipeline_id() : 0u;
+  auto log_column_types = [pipeline_id](const operator_data& data, const char* label) {
+    const auto& batches = data.get_data_batches();
+    if (!batches.empty() && batches[0] && batches[0]->get_data()) {
+      cudf::table_view tv = sirius::get_cudf_table_view(*batches[0]);
+      for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
+        SIRIUS_LOG_DEBUG("Pipeline {}: sink {} col[{}]: {}",
+                         pipeline_id,
+                         label,
+                         c,
+                         cudf::type_to_name(tv.column(c).type()));
+      }
+    }
+  };
+
+  log_column_types(input_data, "before (input_data)");
   // call partition join execute
   auto partition_join_output = partition_join->execute(input_data, stream);
+  log_column_types(*partition_join_output, "after partition_join->execute");
   // call distinct execute
   auto distinct_output = distinct->execute(input_data, stream);
+  log_column_types(*distinct_output, "after distinct->execute");
   // call partition distinct execute
   auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
+  log_column_types(*partition_distinct_output, "after partition_distinct->execute");
   // call partition join sink
   partition_join->sink(*partition_join_output, stream);
   // call partition distinct sink
   partition_distinct->sink(*partition_distinct_output, stream);
+  SIRIUS_LOG_DEBUG("Pipeline {}: sink right delim join done", pipeline_id);
 }
 
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
+  const auto& batches = input_data.get_data_batches();
+  if (!batches.empty() && batches[0] && batches[0]->get_data()) {
+    auto pipeline_id            = get_pipeline() ? get_pipeline()->get_pipeline_id() : 0u;
+    cudf::table_view input_view = sirius::get_cudf_table_view(*batches[0]);
+    for (cudf::size_type c = 0; c < input_view.num_columns(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Left delim join input  col[{}]: {}",
+                       pipeline_id,
+                       c,
+                       cudf::type_to_name(input_view.column(c).type()));
+    }
+    for (duckdb::idx_t c = 0; c < types.size(); ++c) {
+      SIRIUS_LOG_DEBUG("Pipeline {}: Left delim join expected output col[{}]: {}",
+                       pipeline_id,
+                       c,
+                       types[c].ToString());
+    }
+    SIRIUS_LOG_DEBUG("Pipeline {}: Left delim join output (pass-through, same as input)",
+                     pipeline_id);
+  }
   return std::make_unique<operator_data>(input_data);
 }
 
 void sirius_physical_left_delim_join::sink(const operator_data& input_data,
                                            rmm::cuda_stream_view stream)
 {
+  auto pipeline_id      = get_pipeline() ? get_pipeline()->get_pipeline_id() : 0u;
+  auto log_column_types = [pipeline_id](const operator_data& data, const char* label) {
+    const auto& batches = data.get_data_batches();
+    if (!batches.empty() && batches[0] && batches[0]->get_data()) {
+      cudf::table_view tv = sirius::get_cudf_table_view(*batches[0]);
+      for (cudf::size_type c = 0; c < tv.num_columns(); ++c) {
+        SIRIUS_LOG_DEBUG("Pipeline {}: sink {} col[{}]: {}",
+                         pipeline_id,
+                         label,
+                         c,
+                         cudf::type_to_name(tv.column(c).type()));
+      }
+    }
+  };
+
+  log_column_types(input_data, "before (input_data)");
   // call distinct execute
   auto distinct_output = distinct->execute(input_data, stream);
+  log_column_types(*distinct_output, "after distinct->execute");
   // call column data scan execute
   auto column_data_scan_output = column_data_scan->execute(*distinct_output, stream);
+  log_column_types(*column_data_scan_output, "after column_data_scan->execute");
   // call partition distinct execute
   auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
+  log_column_types(*partition_distinct_output, "after partition_distinct->execute");
   // call partition join sink
   column_data_scan->sink(*column_data_scan_output, stream);
   // call partition distinct sink
   partition_distinct->sink(*partition_distinct_output, stream);
+  SIRIUS_LOG_DEBUG("Pipeline {}: sink left delim join done", pipeline_id);
 }
 
 }  // namespace op

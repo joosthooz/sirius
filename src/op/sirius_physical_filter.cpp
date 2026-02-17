@@ -27,6 +27,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <cucascade/data/gpu_data_representation.hpp>
+
 #include <chrono>
 #include <stdexcept>
 
@@ -58,7 +60,19 @@ sirius_physical_filter::sirius_physical_filter(
 std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
-  SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
+  auto& input_data_rep =
+    input_data.get_data_batches()[0]->get_data()->cast<cucascade::gpu_table_representation>();
+  auto input_table = input_data_rep.get_table().view();
+  for (size_t i = 0; i < input_table.num_columns(); ++i) {
+    const auto& col = input_table.column(i);
+    SIRIUS_LOG_DEBUG("Input column {}: type {}", i, cudf::type_to_name(col.type()));
+  }
+  SIRIUS_LOG_DEBUG("Executing expression {}, expression return type: {}",
+                   expression->ToString(),
+                   expression->return_type.ToString());
+  for (const auto& type : types) {
+    SIRIUS_LOG_DEBUG("Expected output column type: {}", cudf::type_to_name(GetCudfType(type)));
+  }
   auto start = std::chrono::high_resolution_clock::now();
 
   const auto& input_batches = input_data.get_data_batches();
