@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
@@ -168,6 +169,12 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
+  std::vector<cudf::data_type> expected_cudf_types;
+  const auto& out_types = get_types();
+  expected_cudf_types.reserve(out_types.size());
+  for (const auto& lt : out_types) {
+    expected_cudf_types.push_back(duckdb::GetCudfType(lt));
+  }
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
@@ -175,7 +182,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
                                                               stream,
-                                                              *input_batch->get_memory_space());
+                                                              *input_batch->get_memory_space(),
+                                                              &expected_cudf_types);
     results.push_back(std::move(result));
   }
   return std::make_unique<operator_data>(results);

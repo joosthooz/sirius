@@ -99,7 +99,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  const std::vector<cudf::data_type>* expected_types)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -169,6 +170,22 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       size_t output_col_id       = group_idx.size() + output_idx[j];
       output_cols[output_col_id] = std::move(aggregation_result.results[j]);
     }
+  }
+
+  // Optionally cast columns to expected types (e.g. decimal64 -> decimal128)
+  if (expected_types != nullptr &&
+      static_cast<size_t>(expected_types->size()) == output_cols.size()) {
+    auto mr = memory_space.get_default_allocator();
+    std::vector<std::unique_ptr<cudf::column>> cast_cols;
+    cast_cols.reserve(output_cols.size());
+    for (size_t c = 0; c < output_cols.size(); ++c) {
+      if (output_cols[c]->view().type() != (*expected_types)[c]) {
+        cast_cols.push_back(cudf::cast(output_cols[c]->view(), (*expected_types)[c], stream, mr));
+      } else {
+        cast_cols.push_back(std::move(output_cols[c]));
+      }
+    }
+    output_cols = std::move(cast_cols);
   }
 
   // Create the output data batch

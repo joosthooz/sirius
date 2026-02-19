@@ -196,11 +196,18 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   if (input_batches.size() == 1) {
     merged = input_batches[0];
   } else {
+    std::vector<cudf::data_type> expected_cudf_types;
+    const auto& out_types = get_types();
+    expected_cudf_types.reserve(out_types.size());
+    for (const auto& lt : out_types) {
+      expected_cudf_types.push_back(duckdb::GetCudfType(lt));
+    }
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
                                                      stream,
-                                                     *input_batches[0]->get_memory_space());
+                                                     *input_batches[0]->get_memory_space(),
+                                                     &expected_cudf_types);
   }
 
   // If no AVG, return merged result directly

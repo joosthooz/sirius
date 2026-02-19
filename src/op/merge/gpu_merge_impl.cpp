@@ -22,6 +22,7 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/merge.hpp>
+#include <cudf/unary.hpp>
 
 namespace sirius {
 namespace op {
@@ -153,7 +154,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  const std::vector<cudf::data_type>* expected_types)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -214,6 +216,22 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   auto output_cols    = groupby_result.first->release();
   for (auto& aggregation_result : groupby_result.second) {
     output_cols.push_back(std::move(aggregation_result.results[0]));
+  }
+
+  // Optionally cast columns to expected types (e.g. decimal64 -> decimal128)
+  if (expected_types != nullptr &&
+      static_cast<size_t>(expected_types->size()) == output_cols.size()) {
+    auto mr = memory_space.get_default_allocator();
+    std::vector<std::unique_ptr<cudf::column>> cast_cols;
+    cast_cols.reserve(output_cols.size());
+    for (size_t c = 0; c < output_cols.size(); ++c) {
+      if (output_cols[c]->view().type() != (*expected_types)[c]) {
+        cast_cols.push_back(cudf::cast(output_cols[c]->view(), (*expected_types)[c], stream, mr));
+      } else {
+        cast_cols.push_back(std::move(output_cols[c]));
+      }
+    }
+    output_cols = std::move(cast_cols);
   }
 
   // Create the output data batch

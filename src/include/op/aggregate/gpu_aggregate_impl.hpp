@@ -65,6 +65,9 @@ class gpu_aggregate_impl {
    * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param expected_types If non-null, must have size equal to (group_idx.size() +
+   * aggregate_idx.size()). Output columns whose type differs from the corresponding expected type
+   * are cast before return.
    *
    * @return The output data batch.
    */
@@ -74,7 +77,8 @@ class gpu_aggregate_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    const std::vector<cudf::data_type>* expected_types = nullptr);
 };
 
 }  // namespace op
