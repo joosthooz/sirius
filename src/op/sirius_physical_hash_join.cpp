@@ -88,10 +88,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     conditions(std::move(cond)),
     delim_types(std::move(delim_types))
 {
-  if (join_type == duckdb::JoinType::MARK) {
-    throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
-  }
-
   reorder_join_conditions(conditions);
 
   filter_pushdown = std::move(pushdown_info_p);
@@ -416,7 +412,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||
       join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-      join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI) {
+      join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI ||
+      join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::ANTI) {
     auto keys                   = prepare_join_keys(input_batches,
                                   left_key_col_indices,
                                   right_key_col_indices,
@@ -455,6 +452,54 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto filtered_join_object = cudf::filtered_join(
         right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
       left_indices = filtered_join_object.anti_join(left_keys, stream);
+    } else if (join_type == duckdb::JoinType::MARK) {
+      // MARK join: output ALL left rows + a BOOL8 column indicating match presence.
+      // Use semi join to find which left rows have matches in the right table.
+      auto filtered_join_object = cudf::filtered_join(
+        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      auto semi_indices = filtered_join_object.semi_join(left_keys, stream);
+
+      // All left output columns pass through directly (no gather -- all rows kept)
+      cudf::table_view left_cols_to_output =
+        get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
+      auto num_left_rows = left_cols_to_output.num_rows();
+
+      std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
+      for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
+        mark_out_cols.push_back(
+          std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
+      }
+
+      // Create BOOL8 mark column: start all-false, scatter true at matching positions
+      cudf::numeric_scalar<bool> false_scalar(false, true, stream);
+      auto mark_column = cudf::make_column_from_scalar(false_scalar, num_left_rows, stream);
+
+      if (semi_indices->size() > 0) {
+        cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+        auto true_col = cudf::make_column_from_scalar(
+          true_scalar, static_cast<cudf::size_type>(semi_indices->size()), stream);
+
+        cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                      static_cast<cudf::size_type>(semi_indices->size()),
+                                      semi_indices->data(),
+                                      nullptr,
+                                      0,
+                                      0,
+                                      {});
+
+        auto scattered = cudf::scatter(cudf::table_view({true_col->view()}),
+                                       scatter_map,
+                                       cudf::table_view({mark_column->view()}),
+                                       stream);
+        mark_column    = std::move(scattered->release()[0]);
+      }
+
+      mark_out_cols.push_back(std::move(mark_column));
+
+      // Return early -- skip the normal gather path (MARK outputs all rows, not a subset)
+      auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
+      return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+        make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
@@ -516,6 +561,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
 
     // } else if (join_type == duckdb::JoinType::MARK) {
+    //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+    // } else if (join_type == duckdb::JoinType::ANTI) {
     //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
     // } else if (join_type == duckdb::JoinType::SINGLE) {
     //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
