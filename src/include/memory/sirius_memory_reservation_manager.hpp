@@ -30,6 +30,11 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
     const std::vector<cucascade::memory::memory_space_config>& configs);
 
   ~sirius_memory_reservation_manager();
+
+  /**
+   * @brief Logs peak memory usage for all device and host memory spaces.
+   */
+  void log_peak_memory_stats() const;
 };
 
 }  // namespace memory

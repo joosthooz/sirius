@@ -156,6 +156,7 @@ void SiriusContext::terminate()
   task_creator_.reset();
   downgrade_executor_.reset();
 
+  memory_manager_->log_peak_memory_stats();
   memory_manager_->shutdown();
   memory_manager_.reset();
 

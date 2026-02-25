@@ -25,7 +25,11 @@
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <spdlog/spdlog.h>
 
 namespace sirius {
 namespace memory {
@@ -52,6 +56,33 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
     cudf::reset_current_device_resource_ref();
   });
+}
+
+void sirius_memory_reservation_manager::log_peak_memory_stats() const
+{
+  for (const auto* space : this->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    auto* adaptor = dynamic_cast<cucascade::memory::reservation_aware_resource_adaptor*>(
+      space->get_default_allocator());
+    if (adaptor) {
+      auto peak_bytes = adaptor->get_peak_total_allocated_bytes();
+      spdlog::info("Peak device memory (GPU {}): {} bytes ({:.2f} MiB)",
+                   space->get_device_id(),
+                   peak_bytes,
+                   static_cast<double>(peak_bytes) / (1024.0 * 1024.0));
+    }
+  }
+
+  for (const auto* space : this->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+    auto* host_mr = dynamic_cast<cucascade::memory::fixed_size_host_memory_resource*>(
+      space->get_default_allocator());
+    if (host_mr) {
+      auto peak_bytes = host_mr->get_peak_total_allocated_bytes();
+      spdlog::info("Peak host memory (node {}): {} bytes ({:.2f} MiB)",
+                   space->get_device_id(),
+                   peak_bytes,
+                   static_cast<double>(peak_bytes) / (1024.0 * 1024.0));
+    }
+  }
 }
 
 }  // namespace memory
