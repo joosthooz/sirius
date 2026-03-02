@@ -27,6 +27,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "planner/query.hpp"
+#include "sirius_context.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
