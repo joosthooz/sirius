@@ -143,6 +143,10 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  task_creator_->stop();
+  task_creator_.reset();
+  downgrade_executor_.reset();
+
   memory_manager_->shutdown();
   memory_manager_.reset();
 
@@ -238,6 +242,8 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 {
   spdlog::info("Connection closed.");
+  // remove the context from the registered state
+  context.registered_state->Remove("sirius_state");
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)

@@ -22,7 +22,7 @@
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
-#include <pipeline/sirius_pipeline_itask_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_states.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -42,6 +42,7 @@
 // standard library
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -49,7 +50,7 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 // Parquet Scan Task Global State
 //===----------------------------------------------------------------------===//
-class parquet_scan_task_global_state : public parallel::itask_global_state {
+class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_global_state {
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
  public:
@@ -57,17 +58,20 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
    * @brief Struct representing a range of row groups assigned to a scan task.
    */
   struct row_group_range {
-    row_group_range(size_t start_row_group_p,
+    row_group_range(size_t file_idx,
+                    size_t start_row_group_p,
                     size_t row_group_count_p,
                     size_t reserved_uncompressed_bytes_p,
                     size_t reserved_compressed_bytes_p)
-      : start_row_group(start_row_group_p),
+      : file_idx(file_idx),
+        start_row_group(start_row_group_p),
         row_group_count(row_group_count_p),
         reserved_uncompressed_bytes(reserved_uncompressed_bytes_p),
         reserved_compressed_bytes(reserved_compressed_bytes_p)
     {
     }
 
+    size_t file_idx;
     size_t start_row_group;
     size_t row_group_count;
     size_t reserved_uncompressed_bytes;
@@ -78,11 +82,12 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
   /**
    * @brief Construct the global state for the parquet scan task.
    *
+   * @param[in] pipeline The pipeline associated with this task
    * @param[in] scan_op The physical table scan operator
-   * @param[in] client_ctx The DuckDB client context
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
    */
   parquet_scan_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
 
@@ -97,9 +102,13 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
   /**
    * @brief Get the file path of the Parquet file to scan.
    *
+   * @param[in] file_idx The index of the file path to retrieve.
    * @return A const reference to the file path string.
    */
-  [[nodiscard]] std::string const& get_file_path() const { return _file_path; }
+  [[nodiscard]] std::string const& get_file_path(size_t file_idx) const
+  {
+    return _file_paths[file_idx];
+  }
 
   /**
    * @brief Get the Parquet reader options, e.g., projections, filters, etc.
@@ -128,9 +137,27 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
    *
    * @return The next row group partition index.
    */
-  [[nodiscard]] size_t get_next_rg_partition_idx()
+  [[nodiscard]] std::optional<size_t> get_next_rg_partition_idx()
   {
-    return _next_rg_partition.fetch_add(1, std::memory_order_relaxed);
+    auto const total = _row_group_partitions.size();
+    size_t current   = _next_rg_partition.load(std::memory_order_relaxed);
+    while (true) {
+      if (current >= total) { return std::nullopt; }
+      if (_next_rg_partition.compare_exchange_weak(
+            current, current + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return current;
+      }
+    }
+  }
+
+  /**
+   * @brief Check if there are remaining row group partitions.
+   *
+   * @return True if there are more partitions to process.
+   */
+  [[nodiscard]] bool has_more_partitions() const
+  {
+    return _next_rg_partition.load(std::memory_order_relaxed) < _row_group_partitions.size();
   }
 
   /**
@@ -149,11 +176,12 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
    *
    * Each task/data batch will need its own reader for concurrency reasons.
    *
+   * @param[in] file_idx The file index of the parquet file to read.
    * @return A unique pointer to the hybrid scan Parquet reader.
    */
-  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader() const
+  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(size_t file_idx) const
   {
-    return std::make_unique<hybrid_scan_reader>(_file_metadata, _reader_options);
+    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
 
  private:
@@ -179,12 +207,14 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
   bool _is_projected;                      ///< Whether projection is applied
 
-  std::string _file_path;                            ///< The parquet file path
-  cudf::io::parquet::FileMetaData _file_metadata;    ///< The parquet file metadata
-  cudf::io::parquet_reader_options _reader_options;  ///< Parquet reader options
+  std::vector<std::string> _file_paths;                          ///< The parquet file paths
+  std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
+  cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
 
-  std::vector<size_t> _row_group_uncompressed_bytes;   ///< Per-row-group uncompressed bytes
-  std::vector<size_t> _row_group_compressed_bytes;     ///< Per-row-group compressed bytes
+  std::vector<std::vector<size_t>>
+    _row_group_uncompressed_bytes;  ///< Per-(file,row-group) uncompressed bytes
+  std::vector<std::vector<size_t>>
+    _row_group_compressed_bytes;                       ///< Per-(file,row-group) compressed bytes
   std::vector<row_group_range> _row_group_partitions;  ///< Row-group partitions for tasks
   std::vector<size_t> _selected_column_indices;        ///< Column indices to read (projection)
 
@@ -198,7 +228,7 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
  * @brief Local state for parquet_scan_task, which manages the row group indices assigned to this
  * task and makes the memory allocation for the task.
  */
-class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_local_state {
+class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_local_state {
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
   using memory_space = cucascade::memory::memory_space;
@@ -209,8 +239,9 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_loc
    * @brief Construct the local state for the parquet scan task.
    *
    * @param[in] g_state The global state for the parquet scan task
+   * @param[in] partition_idx The assigned row group partition index
    */
-  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state);
+  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state, size_t partition_idx);
 
   //===----------Methods----------===//
   /**
@@ -230,6 +261,13 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_loc
   {
     return const_cast<memory_space*>(&_reservation->get_memory_space());
   }
+
+  /**
+   * @brief Get the file index of the parquet file to read for this local state.
+   *
+   * @return The file index.
+   */
+  [[nodiscard]] size_t get_file_idx() const { return _file_idx; }
 
   /**
    * @brief Get the host span corresponding to the row group indices assigned to this local state.
@@ -256,9 +294,16 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_loc
    */
   [[nodiscard]] size_t get_reserved_compressed_bytes() const { return _reserved_compressed_bytes; }
 
-  [[nodiscard]] std::vector<cudf::size_type> move_rg_indices() { return std::move(_rg_indices); }
+  /**
+   * @brief Get the vector of row group indices assigned to this local state.
+   *
+   * @return A (const) reference to the vector of row group indices.
+   */
+  [[nodiscard]] std::vector<cudf::size_type> const& get_rg_indices() const { return _rg_indices; }
+  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices() { return _rg_indices; }
 
  private:
+  size_t _file_idx;  ///< The file index of the parquet file to read
   size_t _reserved_uncompressed_bytes =
     0;  ///< Number of uncompressed bytes reserved by the row group range
   size_t _reserved_compressed_bytes =
@@ -300,10 +345,13 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
                     std::shared_ptr<parquet_scan_task_global_state> g_state)
     : pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
       _task_id(task_id),
-      _data_repo(data_repo),
-      _datasource(cudf::io::datasource::create(g_state->get_file_path()))
+      _data_repo(data_repo)
   {
+    auto& l_state_cast = this->_local_state->cast<parquet_scan_task_local_state>();
+    _datasource = cudf::io::datasource::create(g_state->get_file_path(l_state_cast.get_file_idx()));
   }
+
+  ~parquet_scan_task() override;
 
   //===----------Methods----------===//
   /**
@@ -315,7 +363,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @param[in] stream The CUDA stream on which to perform memory operations.
    * @return A vector of shared pointers to data batches produced by this task.
    */
-  op::operator_data compute_task(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the output data batches produced by this task to the shared data repository.

@@ -20,6 +20,8 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 
+#include <mutex>
+
 namespace sirius {
 namespace op {
 
@@ -59,8 +61,11 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   bool sink_order_dependent() const override { return false; }
 
  public:
-  operator_data execute(const operator_data& input_data,
-                        rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::unique_ptr<operator_data> execute(
+    const operator_data& input_data,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   //! Set the final output projection (applied after merge, to remove sort-key-only columns)
   void set_final_projections(duckdb::vector<duckdb::idx_t> proj,
@@ -73,6 +78,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
  private:
   //! Final projection to apply after merge (empty = no extra projection)
   duckdb::vector<duckdb::idx_t> _final_projections;
+  //! Guards concurrent calls to get_next_task_input_data().
+  std::mutex _drain_mutex;
+  //! Tracks which partition to drain next (one task per partition).
+  size_t _current_partition_index{0};
 };
 
 }  // namespace op

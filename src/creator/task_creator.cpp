@@ -19,10 +19,14 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/parquet_scan_task.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "planner/query.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -32,16 +36,18 @@
 
 #include <optional>
 
-namespace sirius::creator {
+namespace sirius {
+namespace creator {
 
 //------------------------------------------------------------------------------
 // task_creator
 //------------------------------------------------------------------------------
 
-task_creator::task_creator(parallel::task_executor_config gpu_executor_config,
-                           parallel::task_executor_config scan_executor_config,
-                           sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
-                           const cucascade::memory::system_topology_info* sys_topology)
+sirius::creator::task_creator::task_creator(
+  parallel::task_executor_config gpu_executor_config,
+  parallel::task_executor_config scan_executor_config,
+  sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+  const cucascade::memory::system_topology_info* sys_topology)
   : _mem_res_mgr(mem_res_mgr)
 {
   // Create the scan executor with memory manager for host allocations
@@ -70,9 +76,9 @@ task_creator::task_creator(parallel::task_executor_config gpu_executor_config,
   _scan_executor->set_task_creator(this);
 }
 
-task_creator::~task_creator() = default;
+sirius::creator::task_creator::~task_creator() = default;
 
-void task_creator::set_client_context(::duckdb::ClientContext& client_context)
+void sirius::creator::task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {
   _client_context = std::addressof(client_context);
   _thread_context = std::make_unique<duckdb::ThreadContext>(client_context);
@@ -80,28 +86,30 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
     std::make_unique<duckdb::ExecutionContext>(client_context, *_thread_context, nullptr);
 }
 
-void task_creator::reset()
+void sirius::creator::task_creator::reset()
 {
   // Clear the scan operator global state map for the new query
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _scan_operator_global_state_map.clear();
+  _parquet_scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
 }
 
-[[nodiscard]] sirius::op::scan::duckdb_scan_executor& task_creator::get_scan_executor() noexcept
+[[nodiscard]] sirius::op::scan::duckdb_scan_executor&
+sirius::creator::task_creator::get_scan_executor() noexcept
 {
   return *_scan_executor;
 }
 
-[[nodiscard]] const sirius::op::scan::duckdb_scan_executor& task_creator::get_scan_executor()
-  const noexcept
+[[nodiscard]] const sirius::op::scan::duckdb_scan_executor&
+sirius::creator::task_creator::get_scan_executor() const noexcept
 {
   return *_scan_executor;
 }
 
-void task_creator::prepare_for_query(duckdb::shared_ptr<planner::query> query)
+void sirius::creator::task_creator::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
   // start() calls open() on the task queue, which also removes any leftover tasks
   _scan_executor->start();
@@ -125,7 +133,7 @@ void task_creator::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   }
 }
 
-std::future<void> task_creator::start_query()
+std::future<void> sirius::creator::task_creator::start_query()
 {
   // Create a new completion handler for this query
   _completion_handler      = std::make_unique<pipeline::completion_handler>();
@@ -142,7 +150,7 @@ std::future<void> task_creator::start_query()
   return future;
 }
 
-void task_creator::schedule_next_scan_tasks()
+void sirius::creator::task_creator::schedule_next_scan_tasks()
 {
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   if (!_priority_scans.empty()) {
@@ -154,10 +162,20 @@ void task_creator::schedule_next_scan_tasks()
   }
 }
 
-op::sirius_physical_operator* task_creator::get_operator_for_next_task(
+op::sirius_physical_operator* sirius::creator::task_creator::get_operator_for_next_task(
   op::sirius_physical_operator* node)
 {
   if (node == nullptr) { return nullptr; }
+
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+    size_t operator_id             = node->get_operator_id();
+    auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
+    if (parquet_task_global_state->has_more_partitions()) {
+      return node;
+    } else {
+      return nullptr;
+    }
+  }
   auto hint = node->get_next_task_hint();
 
   if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
@@ -169,12 +187,19 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     return hint.value().producer;
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer);
+    auto* producer = hint.value().producer;
+    // DuckDB scan tasks create their own continuations internally, so the
+    // task creator should never schedule additional scans from downstream.
+    // (Parquet scans are fine — they use partition indices that self-limit.)
+    if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      return nullptr;
+    }
+    return get_operator_for_next_task(producer);
   }
   return nullptr;
 }
 
-void task_creator::schedule(op::sirius_physical_operator* node, int device_id)
+void sirius::creator::task_creator::schedule(op::sirius_physical_operator* node, int device_id)
 {
   if (node == nullptr) {
     SIRIUS_LOG_WARN("Task Creator: schedule() called with nullptr node");
@@ -189,7 +214,8 @@ void task_creator::schedule(op::sirius_physical_operator* node, int device_id)
   }
 }
 
-void task_creator::schedule(std::unique_ptr<sirius::parallel::itask> task, int device_id)
+void sirius::creator::task_creator::schedule(std::unique_ptr<sirius::parallel::itask> task,
+                                             int device_id)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
     _scan_executor->schedule(std::move(task));
@@ -199,7 +225,8 @@ void task_creator::schedule(std::unique_ptr<sirius::parallel::itask> task, int d
   }
 }
 
-void task_creator::create_and_schedule_task(op::sirius_physical_operator* node, int device_id)
+void sirius::creator::task_creator::create_and_schedule_task(op::sirius_physical_operator* node,
+                                                             int device_id)
 {
   // Find the operator to create a task for based on hints
   node = get_operator_for_next_task(node);
@@ -248,7 +275,7 @@ void task_creator::create_and_schedule_task(op::sirius_physical_operator* node, 
     // need to exhaust input batches until all ports are empty
     while (!node->all_ports_empty()) {
       auto input_data = node->get_next_task_input_data();
-      if (!input_data.has_value()) { break; }
+      if (!input_data) { break; }
       pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
                                       // task creation
 
@@ -266,17 +293,26 @@ void task_creator::create_and_schedule_task(op::sirius_physical_operator* node, 
       }
 
       auto local_state =
-        std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_data.value());
+        std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
       auto task =
         std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
                                                       destination_data_repositories,
                                                       std::move(local_state),
                                                       _gpu_operator_global_state_map[operator_id]);
-      schedule(std::move(task));
+      schedule(std::move(task), device_id);
     }
   }
 }
 
-uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
+void sirius::creator::task_creator::stop()
+{
+  _scan_executor->stop();
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->stop();
+  }
+}
 
-}  // namespace sirius::creator
+uint64_t sirius::creator::task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
+
+}  // namespace creator
+}  // namespace sirius

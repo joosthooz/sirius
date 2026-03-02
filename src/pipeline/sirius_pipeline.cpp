@@ -29,6 +29,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius_engine.hpp"
@@ -171,7 +172,7 @@ sirius_pipeline::get_operators() const
   return result;
 }
 
-std::vector<sirius_pipeline*> sirius_pipeline::get_parents()
+std::vector<sirius_pipeline*> sirius_pipeline::get_parents() const
 {
   std::vector<sirius_pipeline*> result;
   for (auto& weak_parent : parents) {
@@ -291,16 +292,32 @@ void sirius_pipeline::update_pipeline_status()
       pipeline_finished.store(true);
       return;
     }
+  } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+    auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
+    if (!parquet_scan.has_more_partitions) {
+      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
+      return;
+    }
   } else {
     op::sirius_physical_operator* first_node =
       operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
     if (first_node == nullptr) {
       throw duckdb::InternalException("First node of pipeline is nullptr");
     }
+    // Check if any operator has exhausted its limit — this allows the pipeline to finish
+    // early without waiting for the source pipeline to drain all remaining batches.
+    bool limit_exhausted = false;
+    for (auto& op_ref : operators) {
+      if (op_ref.get().is_limit_exhausted()) {
+        limit_exhausted = true;
+        break;
+      }
+    }
     // WSM TODO need to increment task created before pulling data?
     // Lets fix this by putting task creation as a method in the pipeline class so that it can be
     // done atomically.
-    if (first_node->is_source_pipeline_finished() && first_node->all_ports_empty()) {
+    if (limit_exhausted ||
+        (first_node->is_source_pipeline_finished() && first_node->all_ports_empty())) {
       if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
     }
   }
@@ -312,6 +329,16 @@ void sirius_pipeline::mark_task_completed()
 {
   tasks_completed++;
   update_pipeline_status();
+}
+
+std::vector<op::sirius_physical_operator*> sirius_pipeline::get_output_consumers() const
+{
+  auto parents = get_parents();
+  std::vector<op::sirius_physical_operator*> result;
+  for (auto& parent : parents) {
+    if (auto src = parent->get_source(); src) { result.push_back(src.get()); }
+  }
+  return result;
 }
 
 }  // namespace pipeline

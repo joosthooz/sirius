@@ -30,6 +30,8 @@
 
 #include <cudf/table/table.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/data/gpu_data_representation.hpp>
 
 namespace sirius {
@@ -65,21 +67,8 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
-    virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
+    virtual_columns(std::move(virtual_columns_p))
 {
-  auto num_cols = column_ids.size() - gen_row_id_column;
-  for (int col = 0; col < num_cols; col++) {
-    scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
-    scanned_ids.push_back(col);
-  }
-
-  if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
-  }
-
-  fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
@@ -100,8 +89,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     auto primary_idx = column_ids[column_index].GetPrimaryIndex();
     auto col_type    = returned_types[primary_idx];
 
-    // The batch columns are produced by DuckDB scan in the same order as column_ids.
-    // So the batch column index is just the column_index itself.
+    // The batch columns are produced by DUCKDB_SCAN in column_ids order.
+    // So the batch column index is just the column_index itself (an index into column_ids).
     duckdb::idx_t batch_column_index = column_index;
 
     // Create column reference for this filter - uses the batch column index
@@ -128,11 +117,11 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   return conjunction;
 }
 
-operator_data sirius_physical_table_scan::execute(const operator_data& input_data,
-                                                  rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
+                                                                   rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
   const auto& input_batches = input_data.get_data_batches();
-  auto start                = std::chrono::high_resolution_clock::now();
 
   duckdb::unique_ptr<duckdb::Expression> filter_expr;
   if (table_filters) {
@@ -172,9 +161,9 @@ operator_data sirius_physical_table_scan::execute(const operator_data& input_dat
   }
 
   if (needs_projection) {
-    // The batch columns are in the same order as column_ids.
-    // projection_ids tells us which column_ids indices to select for output.
-    // We want the first expected_output_columns elements from projection_ids.
+    // The batch columns are in column_ids order (as produced by DUCKDB_SCAN).
+    // projection_ids are indices into column_ids that specify which columns to keep.
+    // We select the first expected_output_columns entries from projection_ids.
     std::vector<std::shared_ptr<cucascade::data_batch>> projected_batches;
     projected_batches.reserve(output_batches.size());
 
@@ -186,7 +175,7 @@ operator_data sirius_physical_table_scan::execute(const operator_data& input_dat
       auto table    = gpu_rep.release_table();
       auto columns  = table->release();
 
-      // Select only the output columns by moving ownership
+      // Select only the output columns by using projection_ids as indices
       std::vector<std::unique_ptr<cudf::column>> selected;
       selected.reserve(expected_output_columns);
       for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
@@ -206,10 +195,7 @@ operator_data sirius_physical_table_scan::execute(const operator_data& input_dat
     output_batches = std::move(projected_batches);
   }
 
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
-  return operator_data(output_batches);
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

@@ -88,6 +88,9 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -170,6 +173,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -393,7 +399,12 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   } catch (std::exception& e) {
     ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
-    result->plan_error = true;
+    if (Config::ENABLE_DUCKDB_FALLBACK) {
+      result->plan_error = true;
+    } else {
+      throw std::runtime_error("Error in SiriusGeneratePhysicalPlan: " + error.RawMessage());
+      return nullptr;
+    }
   }
 
   for (auto& column : planner.names) {
@@ -424,14 +435,16 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-        if (!Config::ENABLE_FALLBACK_CHECK) {
+        if (Config::ENABLE_DUCKDB_FALLBACK) {
+          SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
           printf(
             "=============================================\nError in SiriusExecuteQuery, fallback "
             "to DuckDB\n=============================================\n");
           data.res = data.conn->Query(data.query);
+        } else {
+          throw std::runtime_error("SiriusExecuteQuery error: " + data.res->GetError());
+          return;
         }
-        // When ENABLE_FALLBACK_CHECK is true, the error propagates (no silent fallback)
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -660,6 +673,12 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
+static void SetEnableDuckdbFallback(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::ENABLE_DUCKDB_FALLBACK = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DUCKDB_FALLBACK to {}", Config::ENABLE_DUCKDB_FALLBACK);
+}
+
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::ENABLE_REGEX_JIT_IMPL = BooleanValue::Get(parameter);
@@ -742,10 +761,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   // Add in config options for duckdb fallback checking
   config.AddExtensionOption("enable_fallback_check",
-                            "Whether to enable checking of fallback to duckdb execution",
+                            "Whether to enable fallback checking",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+
+  config.AddExtensionOption(
+    "enable_duckdb_fallback",
+    "Whether to enable fallback to duckdb execution after an error is detected",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(Config::ENABLE_DUCKDB_FALLBACK),
+    SetEnableDuckdbFallback);
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(

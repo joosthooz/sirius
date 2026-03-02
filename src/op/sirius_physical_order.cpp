@@ -20,6 +20,8 @@
 #include "log/logging.hpp"
 #include "op/order/gpu_order_impl.hpp"
 
+#include <nvtx3/nvtx3.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -36,12 +38,11 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType>
 {
 }
 
-operator_data sirius_physical_order::execute(const operator_data& input_data,
-                                             rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_data& input_data,
+                                                              rmm::cuda_stream_view stream)
 {
+  nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
   const auto& input_batches = input_data.get_data_batches();
-  SIRIUS_LOG_DEBUG("Executing order by");
-  auto start = std::chrono::high_resolution_clock::now();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -79,11 +80,7 @@ operator_data sirius_physical_order::execute(const operator_data& input_data,
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
   }
 
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Order by time: {:.2f} ms", duration.count() / 1000.0);
-
-  return operator_data(output_batches);
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

@@ -29,6 +29,8 @@
 
 #include <util/stream_check_wrapper.hpp>
 
+#include <iostream>
+
 namespace sirius {
 namespace pipeline {
 
@@ -79,7 +81,7 @@ void gpu_pipeline_executor::worker_loop(int worker_id)
     }
 
     // Set reservation on local state
-    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
+    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation));
     } else {

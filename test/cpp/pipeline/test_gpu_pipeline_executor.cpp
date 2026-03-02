@@ -91,9 +91,9 @@ std::shared_ptr<cucascade::data_batch> create_test_batch(cucascade::memory::memo
 }
 
 class test_gpu_pipeline_task_global_state
-  : public sirius::pipeline::gpu_pipeline_task_global_state {
+  : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  test_gpu_pipeline_task_global_state() : gpu_pipeline_task_global_state(nullptr) {}
+  test_gpu_pipeline_task_global_state() : sirius_pipeline_task_global_state(nullptr) {}
 
   void add_error(std::string message)
   {
@@ -227,7 +227,7 @@ TEST_CASE("GPU pipeline executor schedules and executes GPU tasks", "[gpu_pipeli
     batches.push_back(create_test_batch(*mem_space, i, i * 100, 100));
 
     auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
-      sirius::op::operator_data(std::move(batches)));
+      std::make_unique<sirius::op::operator_data>(std::move(batches)));
     auto task = std::make_unique<sirius_pipeline_task>(i, std::move(local_state), global_state);
     executor.schedule(std::move(task));
   }
