@@ -25,8 +25,11 @@
 #include "data/host_parquet_representation.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_task.hpp"
+#include "op/scan/preload_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -159,6 +162,56 @@ void duckdb_scan_executor::prepare_cache_for_scan_operators(
   }
 }
 
+void duckdb_scan_executor::serve_preloaded_scans(
+  const std::vector<sirius::op::sirius_physical_operator*>& scan_operators)
+{
+  std::lock_guard<std::mutex> lock(_cache_mutex);
+
+  for (auto* scan_op : scan_operators) {
+    auto pipeline    = scan_op->get_pipeline();
+    auto pipeline_id = pipeline->get_pipeline_id();
+    auto it          = _cache.find(pipeline_id);
+    if (it == _cache.end() || !it->second) {
+      throw std::runtime_error("serve_preloaded_scans: no cache entry for pipeline " +
+                               std::to_string(pipeline_id));
+    }
+    auto& entry       = it->second;
+    size_t num_cached = entry->batches.size();
+    auto* sink        = pipeline->get_sink().get();
+    auto next_ports   = sink->get_next_port_after_sink();
+    auto* data_repo =
+      next_ports.empty() ? nullptr : next_ports[0].first->get_port(next_ports[0].second)->repo;
+    auto scan_output_ports = scan_op->get_next_port_after_sink();
+
+    std::vector<sirius::op::sirius_physical_operator*> output_consumers;
+    output_consumers.reserve(scan_output_ports.size());
+    for (auto& [child, port_id] : scan_output_ports) {
+      output_consumers.push_back(child);
+    }
+
+    for (size_t i = 0; i < num_cached; ++i) {
+      pipeline->mark_task_created();
+      auto task = std::make_unique<preload_scan_task>(pipeline, data_repo, output_consumers);
+      schedule(std::move(task));
+    }
+
+    // Sentinel: balance the mark_task_created/completed bookkeeping so the
+    // pipeline detects completion once all preload tasks finish.
+    pipeline->mark_task_created();
+    pipeline->mark_task_completed();
+
+    // Mark the scan operator as exhausted so update_pipeline_status() can
+    // detect pipeline completion.
+    if (scan_op->type == sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      auto& parquet_scan               = scan_op->Cast<sirius::op::sirius_physical_parquet_scan>();
+      parquet_scan.has_more_partitions = false;
+    }
+
+    SIRIUS_LOG_INFO(
+      "serve_preloaded_scans: scheduled {} preload tasks for pipeline {}", num_cached, pipeline_id);
+  }
+}
+
 void duckdb_scan_executor::submit_scan_request()
 {
   // Device ID 0 for scan tasks (CPU-based), is_scan = true
@@ -213,8 +266,24 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
       if (entry->batch_index >= entry->batches.size()) {
         throw std::runtime_error("Scan results for query not cached");
       }
-      auto batches = entry->batches[entry->batch_index++];
-      return std::make_unique<op::operator_data>(clone_batches(std::move(batches), stream));
+      auto& batches = entry->batches[entry->batch_index++];
+      if (_cache_in_gpu) { return std::make_unique<op::operator_data>(batches); }
+      // Clone based on data representation type — no dependency on task type.
+      std::vector<std::shared_ptr<cucascade::data_batch>> cloned;
+      cloned.reserve(batches.size());
+      for (auto& batch : batches) {
+        auto* data = batch->get_data();
+        if (auto* host_data = dynamic_cast<cached_host_data_representation*>(data)) {
+          cloned.push_back(std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+                                                                   host_data->shallow_clone()));
+        } else if (auto* parquet_rep = dynamic_cast<cached_host_parquet_representation*>(data)) {
+          cloned.push_back(std::make_shared<cucascade::data_batch>(get_next_batch_id(),
+                                                                   parquet_rep->shallow_clone()));
+        } else {
+          cloned.push_back(batch->clone(get_next_batch_id(), stream));
+        }
+      }
+      return std::make_unique<op::operator_data>(std::move(cloned));
     } else {
       auto scan_output = task->compute_task(stream);
       entry->batches.push_back(clone_batches(scan_output->get_data_batches(), stream));
@@ -247,7 +316,9 @@ void duckdb_scan_executor::manager_loop()
     }
 
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
-    if (scan_task && scan_task->is<parquet_scan_task>()) {
+    bool is_preload = scan_task && scan_task->is<preload_scan_task>();
+    bool is_parquet = !is_preload && scan_task && scan_task->is<parquet_scan_task>();
+    if (is_parquet) {
       auto* parquet_task = dynamic_cast<parquet_scan_task*>(scan_task);
       if (_caching_enabled || _cache_in_gpu) {
         parquet_task->set_materialized_columns(

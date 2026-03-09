@@ -161,6 +161,26 @@ class duckdb_scan_executor {
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _caching_enabled; }
 
   /**
+   * @brief Check if the scan executor is in preload mode (cache is hot).
+   *
+   * @return True if preload mode is active, false otherwise.
+   */
+  [[nodiscard]] bool is_preload_mode() const noexcept { return _preload_mode; }
+
+  /**
+   * @brief Serve all cached scan data by creating lightweight preload tasks.
+   *
+   * In preload mode, this replaces the normal task creator flow: for each
+   * scan operator it creates preload_scan_task instances (one per cached batch
+   * group) and schedules them directly to the scan executor queue.  No file
+   * I/O occurs — no footer reads, no datasource creation.
+   *
+   * @param scan_operators The scan operators whose cached data should be served.
+   */
+  void serve_preloaded_scans(
+    const std::vector<sirius::op::sirius_physical_operator*>& scan_operators);
+
+  /**
    * @brief Prepare cache for scan operators
    *
    * In CACHE mode: ensures cache is empty and creates entries for each operator's ID

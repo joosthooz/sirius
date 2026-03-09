@@ -163,7 +163,21 @@ std::future<void> pipeline_executor::start_query()
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  schedule_next_scan_tasks();
+  if (_scan_executor->is_preload_mode()) {
+    // Preload mode: serve all cached data directly via lightweight tasks.
+    // No file I/O, no task creator involvement for scan tasks.
+    std::vector<op::sirius_physical_operator*> scans;
+    {
+      std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+      while (!_priority_scans.empty()) {
+        scans.push_back(_priority_scans.front());
+        _priority_scans.pop();
+      }
+    }
+    _scan_executor->serve_preloaded_scans(scans);
+  } else {
+    schedule_next_scan_tasks();
+  }
 
   return future;
 }

@@ -17,6 +17,7 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -86,16 +87,21 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
           *_client_context,
           &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
     } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-      const auto& op_params =
-        _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
-          ->get_config()
-          .get_operator_params();
-      _parquet_scan_operator_global_state_map.emplace(
-        operator_id,
-        std::make_shared<op::scan::parquet_scan_task_global_state>(
-          pipeline,
-          &source_operator->Cast<op::sirius_physical_parquet_scan>(),
-          op_params.scan_task_batch_size));
+      // In preload mode the scan executor serves cached data directly via
+      // preload_scan_task — skip the expensive global state creation that
+      // reads file footers and opens datasources.
+      if (!_pipeline_executor->get_scan_executor().is_preload_mode()) {
+        const auto& op_params =
+          _client_context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+            ->get_config()
+            .get_operator_params();
+        _parquet_scan_operator_global_state_map.emplace(
+          operator_id,
+          std::make_shared<op::scan::parquet_scan_task_global_state>(
+            pipeline,
+            &source_operator->Cast<op::sirius_physical_parquet_scan>(),
+            op_params.scan_task_batch_size));
+      }
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
