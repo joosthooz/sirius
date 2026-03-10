@@ -21,6 +21,7 @@
 #include <rmm/cuda_stream.hpp>
 
 #include <algorithm>
+#include <numeric>
 #include <optional>
 #include <thread>
 
@@ -159,18 +160,44 @@ downgrade_executor::collect_candidates_from_partition(
   size_t max_bytes,
   size_t& collected_bytes)
 {
-  std::vector<std::shared_ptr<cucascade::data_batch>> candidates;
+  // Collect all eligible idle batches on the source space
+  std::vector<std::shared_ptr<cucascade::data_batch>> eligible;
   auto batch_ids = repo->get_batch_ids(partition_idx);
   for (auto id : batch_ids) {
-    if (max_bytes > 0 && collected_bytes >= max_bytes) break;
     auto batch = repo->get_data_batch_by_id(id, std::nullopt, partition_idx);
     if (!batch || !batch->get_data()) continue;
     if (batch->get_state() != cucascade::batch_state::idle) continue;
     auto* ms = batch->get_memory_space();
     if (!ms || ms->get_id() != source_space) continue;
+    eligible.push_back(std::move(batch));
+  }
 
-    collected_bytes += batch->get_data()->get_size_in_bytes();
-    candidates.push_back(std::move(batch));
+  // Cache timestamps once per batch to avoid O(N log N) mutex acquisitions during sort
+  using time_point = std::chrono::steady_clock::time_point;
+  std::vector<std::optional<time_point>> timestamps;
+  timestamps.reserve(eligible.size());
+  for (auto& b : eligible) {
+    timestamps.push_back(b->get_last_consumed_time());
+  }
+
+  // Sort an index array by LRU: consumed longest ago first; never-consumed last
+  std::vector<size_t> order(eligible.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&timestamps](size_t i, size_t j) {
+    const auto& ti = timestamps[i];
+    const auto& tj = timestamps[j];
+    if (ti.has_value() && tj.has_value()) return *ti < *tj;  // older = higher priority
+    if (ti.has_value()) return true;                         // consumed before never-consumed
+    if (tj.has_value()) return false;                        // never-consumed after consumed
+    return false;                                            // both never consumed — no preference
+  });
+
+  // Apply byte limit in sorted order
+  std::vector<std::shared_ptr<cucascade::data_batch>> candidates;
+  for (size_t idx : order) {
+    if (max_bytes > 0 && collected_bytes >= max_bytes) break;
+    collected_bytes += eligible[idx]->get_data()->get_size_in_bytes();
+    candidates.push_back(std::move(eligible[idx]));
   }
   return candidates;
 }
@@ -244,6 +271,10 @@ size_t downgrade_executor::run_downgrade_pass(std::vector<downgrade_repository_i
 
   size_t task_count = 0;
   for (auto& batch : all_candidates) {
+    if (!batch->get_last_consumed_time().has_value()) {
+      SIRIUS_LOG_WARN("[downgrade] batch {} selected for downgrade but has never been consumed",
+                      batch->get_batch_id());
+    }
     auto local_state =
       std::make_unique<downgrade_task_local_state>(task_count, 0, std::move(batch));
     auto task = std::make_unique<downgrade_task>(std::move(local_state), global_state);
