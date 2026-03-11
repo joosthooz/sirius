@@ -85,9 +85,11 @@ void SiriusContext::QueryBegin(ClientContext& context)
   sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
   auto query = context.GetCurrentQuery();
+  spdlog::info("QueryBegin: {}", query.substr(0, std::min(query.size(), size_t(120))));
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
+  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
   // Reset task creator state (including scan operator global state map) for the new query
   task_creator_->reset();
@@ -96,6 +98,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
+  spdlog::info("QueryEnd");
   query_.reset();
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
@@ -192,9 +195,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   pipeline_executor_->start();
 
   // Configure scan caching based on config
-  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled(),
-                                               config_.is_cache_decoded_table_enabled(),
-                                               config_.is_cache_in_gpu_enabled());
+  pipeline_executor_->set_scan_caching_config(config_.get_cache_level());
 
   is_initialized_ = true;
 }
