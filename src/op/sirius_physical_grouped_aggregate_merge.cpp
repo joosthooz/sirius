@@ -21,7 +21,10 @@
 #include "op/merge/gpu_merge_impl.hpp"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/groupby.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/explode.hpp>
 #include <cudf/unary.hpp>
 
 #include <nvtx3/nvtx3.hpp>
@@ -203,6 +206,82 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
     return std::make_unique<operator_data>(input_data);
+  }
+
+  // NUNIQUE optimization: when ALL aggregates are count_distinct, replace
+  // MERGE_SETS + count_elements with explode + NUNIQUE to avoid materializing
+  // merged LIST columns. Data is hash-partitioned by group key, so per-partition
+  // NUNIQUE is correct.
+  bool all_count_distinct = has_count_distinct && !has_avg;
+  if (all_count_distinct) {
+    for (const auto& slot : aggregate_slots) {
+      if (!slot.is_count_distinct) {
+        all_count_distinct = false;
+        break;
+      }
+    }
+  }
+
+  if (all_count_distinct && aggregate_slots.size() == 1) {
+    auto* space        = input_batches[0]->get_memory_space();
+    auto mr            = space->get_default_allocator();
+    int num_group_cols = static_cast<int>(group_idx.size());
+    int list_col_idx   = num_group_cols + static_cast<int>(aggregate_slots[0].cudf_idx);
+
+    // Concatenate all input batches
+    std::unique_ptr<cudf::table> concat_table;
+    if (input_batches.size() == 1) {
+      concat_table =
+        std::make_unique<cudf::table>(get_cudf_table_view(*input_batches[0]), stream, mr);
+    } else {
+      std::vector<cudf::table_view> views;
+      views.reserve(input_batches.size());
+      for (auto& batch : input_batches) {
+        views.push_back(get_cudf_table_view(*batch));
+      }
+      concat_table = cudf::concatenate(views, stream, mr);
+    }
+
+    // Build a table of (group_keys..., LIST_column) and explode the LIST column
+    auto concat_view = concat_table->view();
+    std::vector<cudf::column_view> explode_cols;
+    explode_cols.reserve(num_group_cols + 1);
+    for (int i = 0; i < num_group_cols; i++) {
+      explode_cols.push_back(concat_view.column(i));
+    }
+    explode_cols.push_back(concat_view.column(list_col_idx));
+    cudf::table_view explode_input(explode_cols);
+
+    auto exploded      = cudf::explode(explode_input, num_group_cols, stream, mr);
+    auto exploded_view = exploded->view();
+
+    // Groupby with NUNIQUE on the exploded (flat) values
+    std::vector<cudf::column_view> grp_cols;
+    grp_cols.reserve(num_group_cols);
+    for (int i = 0; i < num_group_cols; i++) {
+      grp_cols.push_back(exploded_view.column(i));
+    }
+    cudf::groupby::groupby grpby_obj(cudf::table_view(grp_cols), cudf::null_policy::INCLUDE);
+
+    cudf::groupby::aggregation_request request;
+    request.values = exploded_view.column(num_group_cols);
+    request.aggregations.push_back(
+      cudf::make_nunique_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE));
+    std::vector<cudf::groupby::aggregation_request> requests;
+    requests.push_back(std::move(request));
+
+    auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
+    auto output_cols    = groupby_result.first->release();
+    auto count_col      = std::move(groupby_result.second[0].results[0]);
+    if (count_col->view().type().id() != cudf::type_id::INT64) {
+      count_col = cudf::cast(count_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+    }
+    output_cols.push_back(std::move(count_col));
+
+    auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
+    auto result       = sirius::make_data_batch(std::move(output_table), *space);
+    return std::make_unique<operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
   }
 
   // Merge multiple batches, or use single batch directly if only one
