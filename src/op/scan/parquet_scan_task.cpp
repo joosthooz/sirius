@@ -322,7 +322,11 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                   [&scan_op, &selected_columns](std::size_t col_idx) {
                     selected_columns.push_back(scan_op->names[col_idx]);
                   });
+#if CUDF_VERSION_NUM >= 2604
     _reader_options.set_column_names(std::move(selected_columns));
+#else
+    _reader_options.set_columns(std::move(selected_columns));
+#endif
   }
 
   // Construct the file readers and parse the metadata
