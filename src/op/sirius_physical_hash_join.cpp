@@ -988,6 +988,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         auto result   = _hash_table->full_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
+      } else if (join_type == duckdb::JoinType::SEMI) {
+        left_indices = _filtered_hash_table->semi_join(probe_keys, stream);
+      } else if (join_type == duckdb::JoinType::ANTI) {
+        left_indices = _filtered_hash_table->anti_join(probe_keys, stream);
+      } else if (join_type == duckdb::JoinType::MARK) {
+        auto semi_indices = _filtered_hash_table->semi_join(probe_keys, stream);
+        left_full         = get_cudf_table_view(*input_batches[0]);
+        return resolve_mark_join_result(
+          *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
       } else {
         throw std::runtime_error("Unsupported join type in BUILD_PROBE mode: " +
                                  duckdb::JoinTypeToString(join_type));
