@@ -496,7 +496,16 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
   if (num_partitions == 1 && join_type != duckdb::JoinType::RIGHT &&
       _join_mode != HASH_JOIN_MODE::BUILD_PROBE) {
     bool has_inequality = (num_equality_conditions < conditions.size());
-    if (!has_inequality || join_type == duckdb::JoinType::INNER) {
+
+    // RIGHT_SEMI/RIGHT_ANTI with equality-only conditions: STANDARD mode's
+    // filtered_join::semi_join/anti_join is a single optimised cudf call, whereas BUILD_PROBE
+    // requires an extra bitmap scatter + boolean mask.  Only enable BUILD_PROBE when inequality
+    // conditions are present (which forces MIXED_JOIN otherwise — a full barrier).
+    bool is_right_semi_anti =
+      (join_type == duckdb::JoinType::RIGHT_SEMI || join_type == duckdb::JoinType::RIGHT_ANTI);
+    if (is_right_semi_anti && !has_inequality) {
+      // Keep STANDARD mode.
+    } else if (!has_inequality || join_type == duckdb::JoinType::INNER) {
       _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
       SIRIUS_LOG_INFO(
         "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and "
