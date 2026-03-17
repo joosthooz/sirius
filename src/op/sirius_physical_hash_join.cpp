@@ -1237,6 +1237,8 @@ void sirius_physical_hash_join::finalize_operator()
   std::lock_guard<std::mutex> lg(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
+    _filtered_hash_table.reset();
+    _build_match_bitmap.reset();
     _build_table.reset();
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
