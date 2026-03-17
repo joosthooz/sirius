@@ -165,8 +165,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     _filtered_hash_table;  // filtered_join object for SEMI/ANTI/MARK in BUILD_PROBE mode
   std::shared_ptr<::cucascade::data_batch>
     _build_table;  // owned build table for BUILD_PROBE mode, to materialize build side results
-  std::unique_ptr<cudf::column>
-    _build_match_bitmap;  // boolean bitmap tracking matched build rows for RIGHT_SEMI/RIGHT_ANTI
   std::vector<std::unique_ptr<cudf::column>>
     _built_table_cast_columns;  // scope holder for any columns that may have had to be cast for the
                                 // build table

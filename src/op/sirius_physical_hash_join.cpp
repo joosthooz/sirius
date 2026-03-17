@@ -932,17 +932,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
             join_type == duckdb::JoinType::MARK) {
           _filtered_hash_table = std::make_unique<cudf::filtered_join>(
             build_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
-        } else if (join_type == duckdb::JoinType::RIGHT_SEMI ||
-                   join_type == duckdb::JoinType::RIGHT_ANTI) {
-          _hash_table =
-            std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
-          auto num_build_rows = _build_table->get_data()
-                                  ->cast<cucascade::gpu_table_representation>()
-                                  .get_table()
-                                  .view()
-                                  .num_rows();
-          cudf::numeric_scalar<bool> false_scalar(false, true, stream);
-          _build_match_bitmap = cudf::make_column_from_scalar(false_scalar, num_build_rows, stream);
         } else {
           _hash_table =
             std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
@@ -1247,7 +1236,6 @@ void sirius_physical_hash_join::finalize_operator()
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     _hash_table.reset();
     _filtered_hash_table.reset();
-    _build_match_bitmap.reset();
     _build_table.reset();
     _built_table_cast_columns.clear();
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
