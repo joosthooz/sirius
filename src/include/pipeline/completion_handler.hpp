@@ -53,7 +53,6 @@ class completion_handler {
     bool expected = false;
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
-        _has_error.store(true);
         _promise.set_exception(error);
       } catch (...) {
         // Promise already satisfied or other error - ignore
@@ -74,7 +73,6 @@ class completion_handler {
     bool expected = false;
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
-        _has_error.store(true);
         _promise.set_exception(std::make_exception_ptr(std::runtime_error(error.data())));
       } catch (...) {
         // Promise already satisfied or other error - ignore
@@ -114,17 +112,9 @@ class completion_handler {
    */
   [[nodiscard]] bool is_completed() const noexcept { return _completed.load(); }
 
-  /**
-   * @brief Check if the handler has already been completed with an error.
-   *
-   * @return True if an error has been reported, false otherwise.
-   */
-  [[nodiscard]] bool has_error() const noexcept { return _has_error.load(); }
-
  private:
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};
-  std::atomic<bool> _has_error{false};
 };
 
 }  // namespace sirius::pipeline

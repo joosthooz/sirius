@@ -277,7 +277,7 @@ TEST_CASE("interruptible_mpmc reset after interrupt re-enables queue", "[interru
   REQUIRE_FALSE(queue.is_open());
   REQUIRE_FALSE(queue.push(std::make_unique<int>(1)));
 
-  queue.reactivate();
+  queue.reset();
   REQUIRE(queue.is_open());
   REQUIRE(queue.push(std::make_unique<int>(42)));
 
