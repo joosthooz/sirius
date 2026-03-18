@@ -38,12 +38,38 @@ using namespace sirius::test::operator_utils;
 //===----------------------------------------------------------------------===//
 
 /**
+ * @brief Subclass of sirius_physical_hash_join that exposes protected state for testing.
+ *
+ * Allows unit tests to force the operator into BUILD_PROBE SCHEDULED state so that
+ * execute() exercises the build-then-probe code path without requiring a full task
+ * infrastructure (repos, ports, get_next_task_hint / get_next_task_input_data).
+ */
+class testable_hash_join : public sirius_physical_hash_join {
+ public:
+  using sirius_physical_hash_join::sirius_physical_hash_join;
+
+  /// Switches the operator to BUILD_PROBE mode with SCHEDULED state so that the
+  /// next execute() call will build the hash table from the build batches and
+  /// immediately probe with the probe batch.
+  void force_build_probe_scheduled()
+  {
+    _join_mode              = HASH_JOIN_MODE::BUILD_PROBE;
+    _hash_table_build_state = BUILD_HASH_TABLE_STATE::SCHEDULED;
+  }
+};
+
+/**
  * @brief Holds the LogicalComparisonJoin and hash join needed for mark join tests.
  * The logical_join must outlive the hash_join because hash_join stores op.types by reference.
  */
 struct mark_join_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
+};
+
+struct mark_join_bp_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<testable_hash_join> hash_join;
 };
 
 /**
@@ -86,6 +112,49 @@ mark_join_fixture create_mark_join()
     1000,
     nullptr);
 
+  return f;
+}
+
+/**
+ * @brief Create a testable mark join fixture for BUILD_PROBE-mode tests.
+ * Schema matches create_mark_join(): left {INTEGER, INTEGER}, right {INTEGER}, key = col[0].
+ */
+mark_join_bp_fixture create_mark_join_build_probe()
+{
+  mark_join_bp_fixture f;
+
+  f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  f.logical_join->types = {
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+
+  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER},
+    0);
+  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
+    0);
+
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition cond;
+  cond.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  conditions.push_back(std::move(cond));
+
+  f.hash_join = duckdb::make_uniq<testable_hash_join>(*f.logical_join,
+                                                      std::move(left_child),
+                                                      std::move(right_child),
+                                                      std::move(conditions),
+                                                      duckdb::JoinType::MARK,
+                                                      duckdb::vector<duckdb::idx_t>{},
+                                                      duckdb::vector<duckdb::idx_t>{},
+                                                      duckdb::vector<duckdb::LogicalType>{},
+                                                      1000,
+                                                      nullptr);
+
+  f.hash_join->force_build_probe_scheduled();
   return f;
 }
 
@@ -242,4 +311,122 @@ TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, true, false});
+}
+
+//===----------------------------------------------------------------------===//
+// BUILD_PROBE mode tests
+//
+// These tests exercise the same scenarios as the STANDARD-mode tests above, but
+// force the operator into BUILD_PROBE mode via testable_hash_join so that the
+// _filtered_hash_table build → semi_join → resolve_mark_join_result code path
+// is covered.  inputs[0] = probe batch, inputs[1] = build batch (same layout as
+// STANDARD mode).
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("sirius_physical_hash_join mark join BUILD_PROBE - partial match", "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30, 40, 50};
+  std::vector<int32_t> left_payload = {1, 2, 3, 4, 5};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  std::vector<int32_t> right_ids = {20, 40};
+  auto right_batch = make_numeric_batch<int32_t>(*space, right_ids, cudf::type_id::INT32);
+
+  auto f = create_mark_join_build_probe();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs = f.hash_join->execute(operator_data(inputs), cudf::get_default_stream());
+
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto out_view =
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table().view();
+  REQUIRE(out_view.num_columns() == 3);
+  REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  REQUIRE(copy_column_to_host<bool>(out_view.column(2)) ==
+          std::vector<bool>{false, true, false, true, false});
+}
+
+TEST_CASE("sirius_physical_hash_join mark join BUILD_PROBE - all rows match",
+          "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30};
+  std::vector<int32_t> left_payload = {1, 2, 3};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  std::vector<int32_t> right_ids = {10, 20, 30};
+  auto right_batch = make_numeric_batch<int32_t>(*space, right_ids, cudf::type_id::INT32);
+
+  auto f = create_mark_join_build_probe();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs = f.hash_join->execute(operator_data(inputs), cudf::get_default_stream());
+
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto out_view =
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table().view();
+  REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{true, true, true});
+}
+
+TEST_CASE("sirius_physical_hash_join mark join BUILD_PROBE - no rows match", "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30};
+  std::vector<int32_t> left_payload = {1, 2, 3};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  std::vector<int32_t> right_ids = {40, 50, 60};
+  auto right_batch = make_numeric_batch<int32_t>(*space, right_ids, cudf::type_id::INT32);
+
+  auto f = create_mark_join_build_probe();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs = f.hash_join->execute(operator_data(inputs), cudf::get_default_stream());
+
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto out_view =
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table().view();
+  REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, false, false});
+}
+
+TEST_CASE("sirius_physical_hash_join mark join BUILD_PROBE - empty right side",
+          "[physical_mark_join]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  std::vector<int32_t> left_ids     = {10, 20, 30};
+  std::vector<int32_t> left_payload = {1, 2, 3};
+  auto left_batch                   = make_two_column_batch<int32_t, int32_t>(
+    *space, left_ids, left_payload, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32);
+
+  std::vector<int32_t> right_ids = {};
+  auto right_batch = make_numeric_batch<int32_t>(*space, right_ids, cudf::type_id::INT32);
+
+  auto f = create_mark_join_build_probe();
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{left_batch, right_batch};
+  auto outputs = f.hash_join->execute(operator_data(inputs), cudf::get_default_stream());
+
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto out_view =
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table().view();
+  REQUIRE(out_view.num_rows() == static_cast<cudf::size_type>(left_ids.size()));
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
+  REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
+  REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, false, false});
 }
