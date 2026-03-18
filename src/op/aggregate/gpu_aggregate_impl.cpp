@@ -132,7 +132,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   auto mr          = memory_space.get_default_allocator();
 
   // Dictionary-encode STRING group keys when:
-  //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
+  //  1. Average string length >= 8 bytes (short strings hash nearly as fast as
   //     int32, so the encode/decode overhead is not worthwhile), AND
   //  2. NDV / row_count < 10% (high-cardinality columns produce huge
   //     dictionaries that negate the hashing benefit).
@@ -181,7 +181,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       } else {
         group_cols.push_back(col);
         SIRIUS_LOG_DEBUG(
-          "local_grouped_agg: skipping dict-encode for key col {} (avg_len={:.1f} < 4.0)",
+          "local_grouped_agg: skipping dict-encode for key col {} (avg_len={:.1f} < 8.0)",
           idx,
           avg_len);
       }
