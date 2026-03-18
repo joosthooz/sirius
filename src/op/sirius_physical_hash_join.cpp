@@ -489,6 +489,7 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
+  auto prev_mode = _join_mode;
   if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
       join_type != duckdb::JoinType::RIGHT && _join_mode != HASH_JOIN_MODE::BUILD_PROBE) {
     bool has_inequality = (num_equality_conditions < conditions.size());
@@ -503,11 +504,16 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
       // Keep STANDARD mode.
     } else if (!has_inequality || join_type == duckdb::JoinType::INNER) {
       _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
-      SIRIUS_LOG_INFO("sirius_physical_hash_join id {} switching to BUILD_PROBE mode{}",
-                      this->get_operator_id(),
-                      has_inequality ? " (with inequality post-filter)" : "");
     }
   }
+  SIRIUS_LOG_DEBUG(
+    "update_join_exec_mode id={} join_type={} mode={}{} num_partitions={} build_side_bytes={}",
+    this->get_operator_id(),
+    duckdb::JoinTypeToString(join_type),
+    _join_mode,
+    _join_mode != prev_mode ? fmt::format(" (was {})", prev_mode) : "",
+    num_partitions,
+    build_side_bytes);
 }
 
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()

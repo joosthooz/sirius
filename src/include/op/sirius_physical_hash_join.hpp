@@ -49,6 +49,28 @@ namespace op {
 enum class HASH_JOIN_MODE { STANDARD, BUILD_PROBE, MIXED_JOIN };
 enum class BUILD_HASH_TABLE_STATE { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT, DESTROYED };
 
+}  // namespace op
+}  // namespace sirius
+
+template <>
+struct fmt::formatter<sirius::op::HASH_JOIN_MODE> : fmt::formatter<std::string_view> {
+  auto format(sirius::op::HASH_JOIN_MODE mode, fmt::format_context& ctx)
+  {
+    using M = sirius::op::HASH_JOIN_MODE;
+    std::string_view name;
+    switch (mode) {
+      case M::STANDARD: name = "STANDARD"; break;
+      case M::BUILD_PROBE: name = "BUILD_PROBE"; break;
+      case M::MIXED_JOIN: name = "MIXED_JOIN"; break;
+      default: name = "UNKNOWN"; break;
+    }
+    return fmt::formatter<std::string_view>::format(name, ctx);
+  }
+};
+
+namespace sirius {
+namespace op {
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
