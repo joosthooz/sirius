@@ -374,19 +374,30 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64_t build_side_bytes)
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
-  if (num_partitions == 1 && build_side_bytes < _max_build_hash_table_bytes &&
-      join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::RIGHT_SEMI &&
-      join_type != duckdb::JoinType::ANTI && join_type != duckdb::JoinType::RIGHT_ANTI &&
-      join_type != duckdb::JoinType::RIGHT && join_type != duckdb::JoinType::MARK &&
-      _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
-    // Switch to a more efficient join strategy for small datasets
-    _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
-    SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and build "
-      "side size {} bytes",
-      this->get_operator_id(),
-      num_partitions,
-      build_side_bytes);
+  if (num_partitions == 1 && join_type != duckdb::JoinType::SEMI &&
+      join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::ANTI &&
+      join_type != duckdb::JoinType::RIGHT_ANTI && join_type != duckdb::JoinType::RIGHT &&
+      join_type != duckdb::JoinType::MARK && _join_mode != HASH_JOIN_MODE::MIXED_JOIN) {
+    if (build_side_bytes < _max_build_hash_table_bytes) {
+      // Switch to a more efficient join strategy for small datasets
+      _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
+      SIRIUS_LOG_DEBUG(
+        "sirius_physical_hash_join id {} switching to BUILD_PROBE mode with {} partitions and "
+        "build "
+        "side size {} bytes",
+        this->get_operator_id(),
+        num_partitions,
+        build_side_bytes);
+    } else {
+      SIRIUS_LOG_WARN(
+        "sirius_physical_hash_join id {} not converted to BUILD_PROBE mode: build side size {} "
+        "bytes "
+        "exceeds max_build_hash_table_bytes {} bytes. Consider increasing concat_batch_bytes and "
+        "max_build_hash_table_bytes to allow BUILD_PROBE execution.",
+        this->get_operator_id(),
+        build_side_bytes,
+        _max_build_hash_table_bytes);
+    }
   }
 }
 
