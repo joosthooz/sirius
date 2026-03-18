@@ -18,6 +18,7 @@
 
 #include "config_option.hpp"
 #include "exec/config.hpp"
+#include "log/logging.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -337,6 +338,18 @@ const exec::thread_pool_config& sirius_config::get_task_creator_config() const n
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
 {
   return _scan_executor_config.thread_pool_config;
+}
+
+void operator_params::validate_and_fix()
+{
+  if (concat_batch_bytes > 0 && max_build_hash_table_bytes >= concat_batch_bytes) {
+    SIRIUS_LOG_WARN(
+      "max_build_hash_table_bytes ({}) cannot be >= concat_batch_bytes ({}), clamping to {}",
+      max_build_hash_table_bytes,
+      concat_batch_bytes,
+      concat_batch_bytes - 1);
+    max_build_hash_table_bytes = concat_batch_bytes - 1;
+  }
 }
 
 }  // namespace sirius

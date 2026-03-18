@@ -64,12 +64,7 @@ struct operator_params {
 
   /// Ensures max_build_hash_table_bytes < concat_batch_bytes.
   /// If violated, clamps max_build_hash_table_bytes to concat_batch_bytes - 1.
-  void validate_and_fix()
-  {
-    if (concat_batch_bytes > 0 && max_build_hash_table_bytes >= concat_batch_bytes) {
-      max_build_hash_table_bytes = concat_batch_bytes - 1;
-    }
-  }
+  void validate_and_fix();
 };
 
 struct sirius_config {
