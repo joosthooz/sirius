@@ -502,9 +502,15 @@ void sirius_physical_hash_join::update_join_exec_mode(int num_partitions, uint64
     // conditions are present (which forces MIXED_JOIN otherwise — a full barrier).
     bool is_right_semi_anti =
       (join_type == duckdb::JoinType::RIGHT_SEMI || join_type == duckdb::JoinType::RIGHT_ANTI);
+    // BUILD_PROBE inequality post-filtering is only implemented for INNER joins (see execute()).
+    // LEFT and OUTER joins with inequalities must stay in STANDARD/MIXED_JOIN mode so that
+    // unmatched probe rows are preserved correctly.
+    bool supports_inequality_in_build_probe = (join_type == duckdb::JoinType::INNER);
+    bool can_use_build_probe                = !has_inequality || supports_inequality_in_build_probe;
+
     if (is_right_semi_anti && !has_inequality) {
       // Keep STANDARD mode.
-    } else if (!has_inequality || join_type == duckdb::JoinType::INNER) {
+    } else if (can_use_build_probe) {
       _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     }
   }
@@ -970,10 +976,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                        stream);
         }
       } else if (join_type == duckdb::JoinType::LEFT) {
+        if (num_equality_conditions < conditions.size()) {
+          throw std::runtime_error(
+            "LEFT join with inequality conditions not supported in BUILD_PROBE mode");
+        }
         auto result   = _hash_table->left_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
       } else if (join_type == duckdb::JoinType::OUTER) {
+        if (num_equality_conditions < conditions.size()) {
+          throw std::runtime_error(
+            "OUTER join with inequality conditions not supported in BUILD_PROBE mode");
+        }
         auto result   = _hash_table->full_join(probe_keys, {}, stream);
         left_indices  = std::move(result.first);
         right_indices = std::move(result.second);
