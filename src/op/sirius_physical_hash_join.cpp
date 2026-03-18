@@ -161,6 +161,8 @@ static void apply_inequality_post_filter(
                                   new_right->size() * sizeof(cudf::size_type),
                                   cudaMemcpyDeviceToDevice,
                                   stream.value()));
+    // Synchronize before filtered_cols is freed — the async copies must complete first.
+    stream.synchronize();
   }
 
   left_indices  = std::move(new_left);
