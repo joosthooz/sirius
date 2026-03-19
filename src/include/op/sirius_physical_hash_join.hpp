@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_set>
 
 namespace sirius {
 
@@ -153,6 +154,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
+  // STANDARD/MIXED_JOIN streaming probe state:
+  // Build side is snapshotted once; probe side IDs are accumulated as batches arrive.
+  bool _build_snapshotted = false;
+  std::vector<std::unordered_set<uint64_t>> _seen_probe_batch_ids;
 
   bool is_all_inequality_join = true;
 
