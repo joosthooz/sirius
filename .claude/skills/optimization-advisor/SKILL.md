@@ -72,10 +72,10 @@ After identifying and implementing an optimization, run queries WITHOUT profilin
 ```bash
 # Sirius-only timing (accurate cold/hot without nsys overhead)
 export SIRIUS_CONFIG_FILE=<path_to_config>
-bash test/tpch_performance/run_tpch_parquet.sh sirius <scale_factor> <iterations> <query_numbers...>
+bash test/tpch_performance/run_tpch_parquet.sh sirius --iterations <iterations> <scale_factor>  <query_numbers...>
 
 # Full DuckDB vs Sirius benchmark with result validation
-bash test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+bash test/tpch_performance/benchmark_and_validate.sh --iterations <iterations> <scale_factor>
 ```
 
 Compare these non-profiled timings against a previous non-profiled baseline to confirm the optimization actually improved wall-clock performance. Then run a new profiled analysis to understand what changed internally.

@@ -33,11 +33,11 @@ bash test/tpch_performance/nsys_report.sh --sf <scale_factor> [query_numbers...]
 ```bash
 # Option A: Sirius-only timing
 export SIRIUS_CONFIG_FILE=<path_to_config>
-bash test/tpch_performance/run_tpch_parquet.sh sirius <scale_factor> <iterations> <query_numbers...>
+bash test/tpch_performance/run_tpch_parquet.sh sirius <scale_factor> <query_numbers...>
 
 # Option B: Full DuckDB vs Sirius benchmark with validation
 export SIRIUS_CONFIG_FILE=<path_to_config>
-bash test/tpch_performance/benchmark_and_validate.sh <scale_factor> <iterations>
+bash test/tpch_performance/benchmark_and_validate.sh <scale_factor>
 ```
 
 The non-profiled run produces per-query `timings.csv` files with accurate cold/hot timings. `benchmark_and_validate.sh` also validates GPU results against CPU and produces a comparison table with speedup ratios.
