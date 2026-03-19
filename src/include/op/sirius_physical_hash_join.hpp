@@ -152,12 +152,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::mutex op_state_mutex;
   std::size_t current_partition_index = 0;
   std::size_t num_batches_to_process  = 0;
-  std::vector<std::vector<uint64_t>> left_batch_ids;
-  std::vector<std::vector<uint64_t>> right_batch_ids;
   // STANDARD/MIXED_JOIN streaming probe state:
-  // Build side is snapshotted once; probe side IDs are accumulated as batches arrive.
+  // Build side is snapshotted once as a flat list; probe batches accumulate as they arrive.
+  // Using flat (partition_idx, batch_id) pairs supports build/probe sides with different
+  // partition counts — we do a full cross-product and let cuDF handle key matching.
   bool _build_snapshotted = false;
-  std::vector<std::unordered_set<uint64_t>> _seen_probe_batch_ids;
+  struct batch_location {
+    size_t partition_idx;
+    uint64_t batch_id;
+  };
+  std::vector<batch_location> _flat_build_batches;
+  std::vector<batch_location> _flat_probe_batches;
+  std::unordered_set<uint64_t> _seen_probe_batch_ids;
 
   bool is_all_inequality_join = true;
 

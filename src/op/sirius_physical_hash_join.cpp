@@ -529,37 +529,30 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   }
 
   // Snapshot build side once: guaranteed to be done by the time get_next_task_hint returns READY.
+  // Build and probe sides may have different partition counts (e.g. when one side bypasses CONCAT),
+  // so we use flat (partition_idx, batch_id) lists and do a full cross-product. cuDF handles key
+  // matching, so joining every probe batch against every build batch is always correct.
   if (!_build_snapshotted) {
-    if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "
-        "same in operator " +
-        std::to_string(this->get_operator_id()));
+    size_t num_build_partitions = ports["build"]->repo->num_partitions();
+    for (size_t p = 0; p < num_build_partitions; p++) {
+      for (auto id : ports["build"]->repo->get_batch_ids(p)) {
+        _flat_build_batches.push_back({p, id});
+      }
     }
-    size_t num_partitions = ports["build"]->repo->num_partitions();
-    right_batch_ids.reserve(num_partitions);
-    for (size_t i = 0; i < num_partitions; i++) {
-      right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
-    }
-    left_batch_ids.resize(num_partitions);
-    _seen_probe_batch_ids.resize(num_partitions);
     _build_snapshotted = true;
   }
 
-  // Extend probe batch IDs with any newly arrived batches (probe side streams in).
-  // left_batch_ids only grows — IDs are never removed — so current_partition_index stays valid.
-  for (size_t i = 0; i < ports["default"]->repo->num_partitions() && i < left_batch_ids.size();
-       i++) {
-    for (auto id : ports["default"]->repo->get_batch_ids(i)) {
-      if (_seen_probe_batch_ids[i].insert(id).second) { left_batch_ids[i].push_back(id); }
+  // Extend flat probe list with any newly arrived batches (probe side streams in).
+  // _flat_probe_batches only grows, so current_partition_index stays valid as new work arrives.
+  size_t num_probe_partitions = ports["default"]->repo->num_partitions();
+  for (size_t p = 0; p < num_probe_partitions; p++) {
+    for (auto id : ports["default"]->repo->get_batch_ids(p)) {
+      if (_seen_probe_batch_ids.insert(id).second) { _flat_probe_batches.push_back({p, id}); }
     }
   }
 
-  // Recompute total work now that left_batch_ids may have grown.
-  num_batches_to_process = 0;
-  for (size_t i = 0; i < left_batch_ids.size(); i++) {
-    num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
-  }
+  // Total work = every probe batch × every build batch.
+  num_batches_to_process = _flat_probe_batches.size() * _flat_build_batches.size();
 
   if (current_partition_index >= num_batches_to_process) {
     // If both source pipelines are finished and we have no more probe work, pop the build batches
@@ -570,56 +563,37 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     auto* probe_port = get_port("default");
     if (build_port && probe_port && build_port->src_pipeline->is_pipeline_finished() &&
         probe_port->src_pipeline->is_pipeline_finished()) {
-      for (size_t p = 0; p < right_batch_ids.size(); p++) {
-        for (auto id : right_batch_ids[p]) {
-          build_port->repo->pop_data_batch_by_id(id, std::nullopt, p);
-        }
+      for (auto& [p, id] : _flat_build_batches) {
+        build_port->repo->pop_data_batch_by_id(id, std::nullopt, p);
       }
-      right_batch_ids.clear();  // prevent double-pop in finalize_operator()
+      _flat_build_batches.clear();  // prevent double-pop in finalize_operator()
     }
     return nullptr;
   }
 
-  size_t batch_index = current_partition_index++;
+  size_t batch_index    = current_partition_index++;
+  size_t probe_flat_idx = batch_index / _flat_build_batches.size();
+  size_t build_flat_idx = batch_index % _flat_build_batches.size();
 
-  // Walk the partition × left(probe) × right(build) grid to find the pair for this batch_index.
+  auto [probe_part, probe_id] = _flat_probe_batches[probe_flat_idx];
+  auto [build_part, build_id] = _flat_build_batches[build_flat_idx];
+
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
-  size_t counter = 0;
-  for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
-    size_t left_counter = 0;
-    for (auto& left_batch_id : left_batch_ids[partition_idx]) {
-      size_t right_counter = 0;
-      for (auto& right_batch_id : right_batch_ids[partition_idx]) {
-        if (counter == batch_index) {
-          // Pop probe batch on its last build pairing to release it back to the pool.
-          bool pop_left = (right_counter == right_batch_ids[partition_idx].size() - 1);
-          // Build batches are never popped here: we don't know how many probe batches will
-          // arrive, so we keep them alive and free them in finalize_operator().
-          if (pop_left) {
-            input_batch.push_back(ports["default"]->repo->pop_data_batch_by_id(
-              left_batch_id, cucascade::batch_state::task_created, partition_idx));
-          } else {
-            input_batch.push_back(ports["default"]->repo->get_data_batch_by_id(
-              left_batch_id, cucascade::batch_state::task_created, partition_idx));
-          }
-          input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(
-            right_batch_id, cucascade::batch_state::task_created, partition_idx));
-          return std::make_unique<operator_data>(input_batch);
-        }
-        right_counter++;
-        counter++;
-      }
-      left_counter++;
-    }
-  }
 
-  if (input_batch.empty()) {
-    return nullptr;
+  // Pop probe batch on its last build pairing to release it back to the pool.
+  // Build batches are never popped here: they must survive until all probe batches are processed.
+  bool pop_probe = (build_flat_idx == _flat_build_batches.size() - 1);
+  if (pop_probe) {
+    input_batch.push_back(ports["default"]->repo->pop_data_batch_by_id(
+      probe_id, cucascade::batch_state::task_created, probe_part));
   } else {
-    throw std::runtime_error("Expected to have returned already or received nothing, but got " +
-                             std::to_string(input_batch.size()) + " input batches for hash join");
+    input_batch.push_back(ports["default"]->repo->get_data_batch_by_id(
+      probe_id, cucascade::batch_state::task_created, probe_part));
   }
+  input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(
+    build_id, cucascade::batch_state::task_created, build_part));
+  return std::make_unique<operator_data>(input_batch);
 }
 
 /// Result of prepare_join_keys for a single join side: the key table view and any cast columns
@@ -1114,14 +1088,14 @@ void sirius_physical_hash_join::finalize_operator()
     _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
   } else {
     // STANDARD/MIXED_JOIN: build batches were kept alive in the repo throughout execution.
-    // Pop them now so cuCascade can reclaim their memory.
+    // Pop any that weren't already freed in get_next_task_input_data() so cuCascade can reclaim
+    // their memory. _flat_build_batches is cleared there when both pipelines finish early.
     auto* build_port = get_port("build");
     if (build_port) {
-      for (size_t p = 0; p < right_batch_ids.size(); p++) {
-        for (auto id : right_batch_ids[p]) {
-          build_port->repo->pop_data_batch_by_id(id, std::nullopt, p);
-        }
+      for (auto& [p, id] : _flat_build_batches) {
+        build_port->repo->pop_data_batch_by_id(id, std::nullopt, p);
       }
+      _flat_build_batches.clear();
     }
   }
 }
