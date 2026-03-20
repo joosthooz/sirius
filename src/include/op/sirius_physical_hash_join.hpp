@@ -130,6 +130,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @param build_side_bytes
   void update_join_exec_mode(int num_partitions, uint64_t build_side_bytes);
 
+  /// Byte threshold for the **final** build-side concat pull after the partition pipeline has
+  /// finished. When execution mode is BUILD_PROBE, returns
+  /// max(configured_concat_batch_bytes, _max_build_hash_table_bytes). The build concat operator
+  /// only uses this once all build batches are available; until then it uses `concat_batch_bytes`.
+  [[nodiscard]] uint64_t effective_build_concat_batch_bytes(
+    uint64_t configured_concat_batch_bytes) const;
+
+  [[nodiscard]] bool is_build_probe_mode() const;
+
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -148,7 +157,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Becomes a source when it is an external join
   bool is_source() const override { return true; }
 
-  std::mutex op_state_mutex;
+  mutable std::mutex op_state_mutex;
   std::size_t current_partition_index = 0;
   std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;

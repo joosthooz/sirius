@@ -46,7 +46,7 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   bool is_sink() const override;
 
-  bool is_build_concat();
+  bool is_build_concat() const;
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -61,6 +61,14 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
  private:
+  /// Build-side concat feeding a BUILD_PROBE hash join: do not emit until the partition pipeline
+  /// has finished so the full build can be concatenated once (avoids join-side multi-batch concat).
+  [[nodiscard]] bool build_probe_build_waits_for_complete_input() const;
+
+  /// Byte cap for pulling from partition repos; large build-probe budget only applies after the
+  /// source pipeline has finished (all build batches are present).
+  [[nodiscard]] uint64_t partitioned_pull_byte_threshold(bool source_pipeline_finished) const;
+
   sirius_physical_operator* _parent_op;
   bool _is_build;
   bool _concat_all;

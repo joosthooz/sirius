@@ -25,6 +25,32 @@
 namespace sirius {
 namespace op {
 
+bool sirius_physical_concat::build_probe_build_waits_for_complete_input() const
+{
+  if (!_is_build || _parent_op == nullptr ||
+      _parent_op->type != SiriusPhysicalOperatorType::HASH_JOIN) {
+    return false;
+  }
+  // _concat_all already waits for the pipeline to finish before any concat task.
+  if (_concat_all) { return false; }
+  return _parent_op->Cast<sirius_physical_hash_join>().is_build_probe_mode();
+}
+
+uint64_t sirius_physical_concat::partitioned_pull_byte_threshold(
+  bool source_pipeline_finished) const
+{
+  if (_concat_all) { return _concat_batch_bytes; }
+  if (_is_build && _parent_op != nullptr &&
+      _parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    auto& hj = _parent_op->Cast<sirius_physical_hash_join>();
+    if (hj.is_build_probe_mode()) {
+      if (!source_pipeline_finished) { return _concat_batch_bytes; }
+      return hj.effective_build_concat_batch_bytes(_concat_batch_bytes);
+    }
+  }
+  return _concat_batch_bytes;
+}
+
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
                                                duckdb::idx_t estimated_cardinality,
                                                sirius_physical_operator* parent_op,
@@ -85,8 +111,9 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
       return task_creation_hint{TaskCreationHint::READY, this};
     }
     return std::nullopt;
-  } else if (_concat_all) {
-    // if we need to concat all then we need to wait for the pipeline to be finished
+  } else if (_concat_all || build_probe_build_waits_for_complete_input()) {
+    // Wait until the partition pipeline has produced all batches (_concat_all), or until the full
+    // build is available for BUILD_PROBE (join then receives a single build batch from concat).
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
                               &(port_ptr->src_pipeline->get_operators()[0].get())};
   }
@@ -102,7 +129,8 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
       auto batch      = port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
-      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
+      if (!_concat_all &&
+          total_batch_size > partitioned_pull_byte_threshold(/*source_pipeline_finished=*/false)) {
         // This batch pushes us over the threshold — the loop would stop here.
         // If we already accumulated batches (pulled_count > 0), the overflowing batch stays,
         // so there is at least one batch left after the pull.
@@ -133,6 +161,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
   }
 
   auto port_ptr = ports.begin()->second;
+  const bool pipeline_finished =
+    port_ptr->src_pipeline && port_ptr->src_pipeline->is_pipeline_finished();
   for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
     std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
     // get all the batch ids from the partition
@@ -143,7 +173,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
-      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
+      if (!_concat_all && total_batch_size > partitioned_pull_byte_threshold(pipeline_finished)) {
         // if the batch size is already exceed the threshold, then we need to return the batch right
         // away
         if (input_batch.size() == 0) {
@@ -230,7 +260,7 @@ bool sirius_physical_concat::is_source() const { return true; }
 
 bool sirius_physical_concat::is_sink() const { return true; }
 
-bool sirius_physical_concat::is_build_concat() { return _is_build; }
+bool sirius_physical_concat::is_build_concat() const { return _is_build; }
 
 }  // namespace op
 }  // namespace sirius

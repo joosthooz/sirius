@@ -19,6 +19,8 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -33,6 +35,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <algorithm>
 #include <format>
 #include <optional>
 
@@ -40,6 +43,44 @@ namespace sirius {
 namespace pipeline {
 
 namespace {
+
+[[nodiscard]] bool pipeline_has_hash_join_operator(const sirius_pipeline* pipeline)
+{
+  if (pipeline == nullptr) { return false; }
+  for (auto const& op_ref : pipeline->get_operators()) {
+    if (op_ref.get().type == op::SiriusPhysicalOperatorType::HASH_JOIN) { return true; }
+  }
+  if (auto sink = pipeline->get_sink()) {
+    return sink.get()->type == op::SiriusPhysicalOperatorType::HASH_JOIN;
+  }
+  return false;
+}
+
+[[nodiscard]] bool pipeline_build_concat_uses_build_probe_budget(const sirius_pipeline* pipeline)
+{
+  if (pipeline == nullptr) { return false; }
+  auto concat_is_build_probe = [](op::sirius_physical_concat const& c) {
+    if (!c.is_build_concat()) { return false; }
+    auto* parent = c.get_parent_op();
+    if (parent == nullptr || parent->type != op::SiriusPhysicalOperatorType::HASH_JOIN) {
+      return false;
+    }
+    return parent->Cast<op::sirius_physical_hash_join>().is_build_probe_mode();
+  };
+  for (auto const& op_ref : pipeline->get_operators()) {
+    if (op_ref.get().type == op::SiriusPhysicalOperatorType::CONCAT &&
+        concat_is_build_probe(op_ref.get().Cast<op::sirius_physical_concat>())) {
+      return true;
+    }
+  }
+  if (auto sink = pipeline->get_sink()) {
+    if (sink.get()->type == op::SiriusPhysicalOperatorType::CONCAT &&
+        concat_is_build_probe(sink.get()->Cast<op::sirius_physical_concat>())) {
+      return true;
+    }
+  }
+  return false;
+}
 
 std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
@@ -441,15 +482,17 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
   auto* pipeline   = _global_state != nullptr
                        ? _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()
                        : nullptr;
-  if (pipeline != nullptr) {
-    for (auto& op_ref : pipeline->get_operators()) {
-      if (op_ref.get().type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
-        // Hash join keeps build side in memory; reserve 1.5x input size.
-        return (base * 3) / 2;
-      }
-    }
+  if (pipeline == nullptr) { return base; }
+
+  std::size_t out = base;
+  // Build-side concat under BUILD_PROBE may buffer up to max_build_hash_table_bytes in one task;
+  // cuDF concatenate keeps inputs plus output — reserve at least 2x input for that pipeline.
+  if (pipeline_build_concat_uses_build_probe_budget(pipeline)) { out = std::max(out, base * 2); }
+  if (pipeline_has_hash_join_operator(pipeline)) {
+    // Hash join keeps build side in memory; reserve 1.5x input size.
+    out = std::max(out, (base * 3) / 2);
   }
-  return base;
+  return out;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
