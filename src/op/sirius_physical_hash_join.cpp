@@ -454,8 +454,11 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       // finalize_operator() cleared the join; no further tasks for this operator.
       return std::nullopt;
     } else {
-      throw std::runtime_error(
-        "Invalid hash table build state in sirius_physical_hash_join::get_next_task_hint");
+      throw std::runtime_error(fmt::format(
+        "Invalid hash table build state {} in sirius_physical_hash_join::get_next_task_hint "
+        "for operator id {}",
+        static_cast<int>(_hash_table_build_state),
+        this->get_operator_id()));
     }
   } else {
     return sirius_physical_operator::get_next_task_hint();
