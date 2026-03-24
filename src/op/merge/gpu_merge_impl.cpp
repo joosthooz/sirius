@@ -21,10 +21,11 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
-#include <cudf/merge.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
 namespace sirius {
@@ -317,18 +318,34 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
       "`null_precedence` in `merge_order_by()`");
   }
 
-  // Pull input cudf tables and merge.
+  // Pull input cudf tables.
   std::vector<cudf::table_view> input_tables;
   input_tables.reserve(input.size());
   for (const auto& batch : input) {
     input_tables.push_back(get_cudf_table_view(*batch));
   }
-  auto output_table = cudf::merge(input_tables,
-                                  order_key_idx,
-                                  column_order,
-                                  null_precedence,
-                                  stream,
-                                  memory_space.get_default_allocator());
+
+  // Concatenate all batches then sort by key columns.
+  // cudf::merge has a bug with STRING columns in cudf 26.2.x that triggers
+  // validate_segmented_indices with end < begin (null_mask.cuh:606).
+  // Using concatenate + sorted_order + gather avoids that code path.
+  auto concat_table = cudf::concatenate(input_tables, stream, memory_space.get_default_allocator());
+
+  std::vector<cudf::column_view> sort_key_views;
+  sort_key_views.reserve(order_key_idx.size());
+  for (auto k : order_key_idx) {
+    sort_key_views.push_back(concat_table->view().column(k));
+  }
+  auto sorted_order_col = cudf::sorted_order(cudf::table_view(sort_key_views),
+                                             column_order,
+                                             null_precedence,
+                                             stream,
+                                             memory_space.get_default_allocator());
+  auto output_table     = cudf::gather(concat_table->view(),
+                                   sorted_order_col->view(),
+                                   cudf::out_of_bounds_policy::DONT_CHECK,
+                                   stream,
+                                   memory_space.get_default_allocator());
 
   // Create the output data batch
   return make_data_batch(std::move(output_table), memory_space);
