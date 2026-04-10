@@ -1,0 +1,3 @@
+# Optional deps for join_batch_benchmark_plots.ipynb
+matplotlib>=3.7
+pandas>=2.0
