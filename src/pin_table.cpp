@@ -17,6 +17,7 @@
 #include "pin_table.hpp"
 
 #include "compression/compressed_representation.hpp"
+#include "compression/device_compressed_blob.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "io/io_context.hpp"
 #include "log/logging.hpp"
@@ -31,6 +32,8 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/logging_resource_adaptor.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
@@ -259,6 +262,39 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
 }
 
+// --- TEMPORARY compression allocation tracing (env-guarded, remove after analysis) ---
+struct compress_alloc_trace_scope {
+  bool active = false;
+  cuda::mr::any_resource<cuda::mr::device_accessible> prev{
+    rmm::mr::get_current_device_resource_ref()};
+
+  compress_alloc_trace_scope()
+  {
+    static rmm::mr::logging_resource_adaptor* logger = [] {
+      const char* path = std::getenv("SIRIUS_COMPRESS_RMM_LOG");
+      if (path == nullptr || *path == '\0') {
+        return static_cast<rmm::mr::logging_resource_adaptor*>(nullptr);
+      }
+      return new rmm::mr::logging_resource_adaptor(
+        cuda::mr::any_resource<cuda::mr::device_accessible>{
+          rmm::mr::get_current_device_resource_ref()},
+        std::string(path),
+        /*auto_flush=*/true);
+    }();
+    if (logger != nullptr) {
+      active = true;
+      prev =
+        rmm::mr::set_current_device_resource(cuda::mr::any_resource<cuda::mr::device_accessible>{
+          rmm::device_async_resource_ref{*logger}});
+    }
+  }
+
+  ~compress_alloc_trace_scope()
+  {
+    if (active) { rmm::mr::set_current_device_resource(std::move(prev)); }
+  }
+};
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -283,6 +319,8 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   // masks), so string columns count toward the threshold.
   const std::size_t uncompressed_bytes = tbl.alloc_size();
   if (uncompressed_bytes < compression.min_batch_size_bytes) { return false; }
+
+  compress_alloc_trace_scope alloc_trace{};  // TEMPORARY: trace compression allocations
 
   // Parallel per-column compress when >1 (capped at the column count). The pool
   // must outlive `ct` (whose buffers free on the pool streams at teardown), so it
@@ -497,14 +535,50 @@ device_pin_result materialize_all_batches_compressed(
             compression,
             stream,
             "materialize_all_batches_compressed",
-            [&](simpatico::compressed_table&& ct,
-                std::vector<std::uint8_t>&& /*header*/,
-                std::vector<simpatico::payload_buffer_ref> const& /*buffers*/,
+            [&](simpatico::compressed_table&& /*ct*/,
+                std::vector<std::uint8_t>&& header,
+                std::vector<simpatico::payload_buffer_ref> const& buffers,
                 std::uint64_t payload_bytes,
                 std::size_t uncompressed_bytes) {
+              auto blob = std::make_shared<sirius::compressed_device_blob>();
+
+              // One contiguous device buffer holds all compressed leaf data;
+              // this is the only D2D copy — no re-fetch at query time.
+              blob->payload =
+                rmm::device_buffer(payload_bytes, stream, src_space->get_default_allocator());
+              for (auto const& b : buffers) {
+                if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+                  CUCASCADE_CUDA_TRY(
+                    cudaMemcpyAsync(static_cast<std::byte*>(blob->payload.data()) + b.offset,
+                                    b.device_ptr,
+                                    static_cast<std::size_t>(b.size_bytes),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.value()));
+                }
+              }
+
+              // Build slab offsets (same order as read_compressed_table_from_memory will
+              // allocate), then reconstruct the compressed_table with a no-op fetch so
+              // leaf channels_ are non-owning slices of payload — no second copy.
+              std::vector<std::uint64_t> offsets;
+              offsets.reserve(buffers.size());
+              for (auto const& b : buffers)
+                offsets.push_back(b.offset);
+
+              sirius::slab_memory_resource slab_mr{static_cast<std::byte*>(blob->payload.data()),
+                                                   &offsets};
+              auto noop_fetch = [](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) {};
+              std::string read_err;
+              blob->table = simpatico::read_compressed_table_from_memory(
+                header, noop_fetch, stream, slab_mr, &read_err);
+              if (!read_err.empty()) {
+                throw std::runtime_error("[materialize_all_batches_compressed] " + read_err);
+              }
+              stream.synchronize();
+
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,
-                std::make_shared<simpatico::compressed_table>(std::move(ct)),
+                std::move(blob),
                 compression.column_names,
                 static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,

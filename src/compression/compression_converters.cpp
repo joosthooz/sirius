@@ -17,11 +17,13 @@
 #include "compression_converters.hpp"
 
 #include "compressed_representation.hpp"
+#include "device_compressed_blob.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/logging_resource_adaptor.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
@@ -57,6 +59,43 @@ int decompress_column_threads() noexcept
 }
 
 namespace {
+
+// --- TEMPORARY decompress allocation tracing (env-guarded, remove after analysis) ---
+// When SIRIUS_DECOMPRESS_RMM_LOG is set, install an RMM logging_resource_adaptor as the
+// current device resource for the duration of each decompress region. Every decompress
+// device allocation routes through get_current_device_resource_ref(), so the resulting
+// CSV contains ONLY the decompress path's allocations. Created once, kept for the process.
+struct decompress_alloc_trace_scope {
+  bool active = false;
+  cuda::mr::any_resource<cuda::mr::device_accessible> prev{
+    rmm::mr::get_current_device_resource_ref()};
+
+  decompress_alloc_trace_scope()
+  {
+    static rmm::mr::logging_resource_adaptor* logger = [] {
+      const char* path = std::getenv("SIRIUS_DECOMPRESS_RMM_LOG");
+      if (path == nullptr || *path == '\0') {
+        return static_cast<rmm::mr::logging_resource_adaptor*>(nullptr);
+      }
+      return new rmm::mr::logging_resource_adaptor(
+        cuda::mr::any_resource<cuda::mr::device_accessible>{
+          rmm::mr::get_current_device_resource_ref()},
+        std::string(path),
+        /*auto_flush=*/true);
+    }();
+    if (logger != nullptr) {
+      active = true;
+      prev =
+        rmm::mr::set_current_device_resource(cuda::mr::any_resource<cuda::mr::device_accessible>{
+          rmm::device_async_resource_ref{*logger}});
+    }
+  }
+
+  ~decompress_alloc_trace_scope()
+  {
+    if (active) { rmm::mr::set_current_device_resource(std::move(prev)); }
+  }
+};
 
 // Rebind a column's buffers (recursively) to `s` for their eventual async free.
 // The parallel decompress overload allocates on internal pool streams that are
@@ -167,6 +206,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
+  decompress_alloc_trace_scope alloc_trace{};  // TEMPORARY: trace decompress allocations
   auto& rep = source.cast<compressed_host_representation>();
 
   // Pull each compressed leaf buffer straight from the pinned host payload into
@@ -190,6 +230,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
+  decompress_alloc_trace_scope alloc_trace{};  // TEMPORARY: trace decompress allocations
   auto& rep           = source.cast<compressed_device_representation>();
   auto const& indices = rep.selected_indices();
   auto const& ct      = rep.table();
