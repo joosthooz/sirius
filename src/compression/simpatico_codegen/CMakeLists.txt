@@ -42,10 +42,40 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_link_options(-Wl,--enable-new-dtags)
 link_directories("${CONDA_PREFIX}/lib")
 
+# ---------------------------------------------------------------------------
+# fsst_gpu: the external FSST-GPU (CompactionV5T) codec, compiled as a static
+# library with device symbols resolved internally (it needs relocatable device
+# code; simpatico itself does not). Only the library sources are built here —
+# not fsst-gpu's own executable/tests.
+# ---------------------------------------------------------------------------
+set(FSST_GPU_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../fsst-gpu"
+    CACHE PATH "Path to the fsst-gpu repository")
+set(GTSST_SPLIT_COUNT 512 CACHE STRING "fsst-gpu splits (tiles) per block")
+add_library(
+  fsst_gpu STATIC
+  ${FSST_GPU_DIR}/src/fsst/fsst-lib.cu
+  ${FSST_GPU_DIR}/src/fsst/gtsst-fsst.cu
+  ${FSST_GPU_DIR}/src/compressors/shared.cu
+  ${FSST_GPU_DIR}/src/compressors/compactionv5t/compaction-compressor.cu
+  ${FSST_GPU_DIR}/src/compressors/compactionv5t/compaction-encode.cu
+  ${FSST_GPU_DIR}/src/compressors/compactionv5t/compaction-decompress.cu)
+set_target_properties(
+  fsst_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_SEPARABLE_COMPILATION ON
+                      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(fsst_gpu PUBLIC ${FSST_GPU_DIR}/include)
+target_compile_definitions(fsst_gpu PUBLIC GTSST_SPLIT_COUNT=${GTSST_SPLIT_COUNT})
+target_compile_options(
+  fsst_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream per-thread
+                   --expt-relaxed-constexpr --expt-extended-lambda>)
+find_package(Threads REQUIRED)
+target_link_libraries(fsst_gpu PUBLIC cudart Threads::Threads)
+
 add_library(
   simpatico STATIC
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/operators/fsst_compressor.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -98,7 +128,8 @@ target_link_libraries(
          nvcomp
          nvrtc
          cuda
-         dl)
+         dl
+         fsst_gpu)
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
