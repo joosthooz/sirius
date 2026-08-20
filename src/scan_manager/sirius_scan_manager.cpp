@@ -21,7 +21,9 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
+#include "expression/join_condition.hpp"
 #include "helper/numeric_narrowing.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
@@ -78,8 +80,11 @@
 #include <cstdlib>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -715,15 +720,23 @@ std::optional<std::string> admit_group_key_extension(
     return std::nullopt;
   }
 
-  auto const floor = late_mat::min_group_by_rowid_input_rows();
-  if (floor > 0 && !extension.group_bys.empty()) {
+  auto const floor   = late_mat::min_group_by_rowid_input_rows();
+  auto const ceiling = late_mat::max_group_by_rowid_input_rows();
+  if ((floor > 0 || ceiling > 0) && !extension.group_bys.empty()) {
     auto const* first = extension.group_bys.front();
     std::size_t const input_rows =
       (first != nullptr && !first->children.empty() && first->children[0])
         ? first->children[0]->estimated_cardinality
         : 0;
-    if (input_rows > 0 && input_rows < floor) {
-      say("the first ridden aggregate reads fewer rows than the group-by-rowid floor");
+    if (input_rows > 0 && floor > 0 && input_rows < floor) {
+      say("the first ridden aggregate reads " + std::to_string(input_rows) +
+         " row(s), below the group-by-rowid floor of " + std::to_string(floor));
+      return std::nullopt;
+    }
+    if (input_rows > 0 && ceiling > 0 && input_rows > ceiling) {
+      say("the first ridden aggregate reads " + std::to_string(input_rows) +
+         " row(s), above the group-by-rowid ceiling of " + std::to_string(ceiling) +
+         " (the gather-per-group cost at that fan-out outweighs the ride)");
       return std::nullopt;
     }
   }
@@ -1008,6 +1021,108 @@ struct installed_ride {
   op::scan::sirius_gpu_scan_operator const* scan = nullptr;
 };
 
+/// One INNER-equality join condition whose two sides are both scan-output
+/// columns of a cached (pin-served) scan — an edge in the FD chain graph
+/// (SIRIUS_EXP_LATE_MAT_FD_CHAIN). Built once per query from every cached
+/// assignment's column lifetimes; see @ref row_determined_scans for how it is
+/// walked.
+struct fd_scan_col {
+  op::scan::sirius_gpu_scan_operator* scan = nullptr;
+  pinned_entry const* entry                = nullptr;
+  std::size_t entry_column_pos             = 0;
+};
+struct fd_edge {
+  fd_scan_col a;
+  fd_scan_col b;
+};
+
+/// One cached scan's (op, entry, served columns) triple — collect_fd_edges'
+/// input, kept free of sirius_scan_manager::cached_assignment (private to the
+/// class) so this stays a free function.
+struct fd_source {
+  op::scan::sirius_gpu_scan_operator* op          = nullptr;
+  pinned_entry const* entry                       = nullptr;
+  std::vector<std::size_t> const* columns         = nullptr;
+};
+
+/// Every INNER-equality join condition that compares two cached scans'
+/// columns, one edge per condition. Non-INNER joins and non-equality
+/// conditions contribute nothing — the same restriction v1/v2 rider admission
+/// already relies on (@ref rider_determined_by_ride).
+[[nodiscard]] std::vector<fd_edge> collect_fd_edges(std::span<fd_source const> assignments)
+{
+  struct half {
+    op::scan::sirius_gpu_scan_operator* scan;
+    pinned_entry const* entry;
+    std::size_t entry_column_pos;
+  };
+  std::map<std::pair<op::sirius_physical_operator const*, std::size_t>,
+           std::pair<std::optional<half>, std::optional<half>>>
+    by_condition;
+  for (auto const& assignment : assignments) {
+    auto const lifetimes = sirius::planner::analyze_column_lifetimes(*assignment.op);
+    for (auto const& life : lifetimes) {
+      if (life.scan_output_position >= assignment.columns->size()) { continue; }
+      auto const entry_pos = (*assignment.columns)[life.scan_output_position];
+      for (auto const& role : life.join_key_at) {
+        auto const* hj = dynamic_cast<op::sirius_physical_hash_join const*>(role.join);
+        if (hj == nullptr || hj->join_type != duckdb::JoinType::INNER) { continue; }
+        if (role.condition >= hj->conditions.size()) { continue; }
+        if (hj->conditions[role.condition].comparison != sirius::comparison_type::equal) {
+          continue;
+        }
+        auto& slot = by_condition[{role.join, role.condition}];
+        auto& mine = role.from_lhs ? slot.first : slot.second;
+        if (!mine) { mine = half{assignment.op, assignment.entry, entry_pos}; }
+      }
+    }
+  }
+  std::vector<fd_edge> edges;
+  edges.reserve(by_condition.size());
+  for (auto const& [key, halves] : by_condition) {
+    if (!halves.first || !halves.second) { continue; }
+    edges.push_back(fd_edge{{halves.first->scan, halves.first->entry, halves.first->entry_column_pos},
+                            {halves.second->scan, halves.second->entry, halves.second->entry_column_pos}});
+  }
+  return edges;
+}
+
+/// Every scan whose ROW is transitively determined by @p seed's row, walking
+/// @p edges to a fixed point (SIRIUS_EXP_LATE_MAT_FD_CHAIN).
+///
+/// `seed`'s row is determined by definition (it is the group). Each edge
+/// propagates determination one hop: if one side's SCAN is already
+/// row-determined, and the OTHER side's column is proven unique over its
+/// pinned table, then the other scan's row is determined too — at most one of
+/// its rows can match the determined side's fixed value. A chain composes the
+/// same one-hop argument link by link; an unprovable hop just stops the walk
+/// there; nothing downstream of it is admitted.
+[[nodiscard]] std::set<op::scan::sirius_gpu_scan_operator*> row_determined_scans(
+  std::vector<fd_edge> const& edges, op::scan::sirius_gpu_scan_operator const* seed)
+{
+  std::set<op::scan::sirius_gpu_scan_operator*> determined{
+    const_cast<op::scan::sirius_gpu_scan_operator*>(seed)};
+  auto const col_is_unique = [](fd_scan_col const& c) {
+    return c.entry != nullptr && c.entry_column_pos < c.entry->proven_unique_columns.size() &&
+           c.entry->proven_unique_columns[c.entry_column_pos];
+  };
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto const& e : edges) {
+      for (int dir = 0; dir < 2; ++dir) {
+        auto const& from = dir == 0 ? e.a : e.b;
+        auto const& to   = dir == 0 ? e.b : e.a;
+        if (!determined.contains(from.scan) || determined.contains(to.scan)) { continue; }
+        if (!col_is_unique(to)) { continue; }
+        determined.insert(to.scan);
+        changed = true;
+      }
+    }
+  }
+  return determined;
+}
+
 /// Whether the rider's row is FUNCTIONALLY DETERMINED by the ride's row.
 ///
 /// The second way to admit a rider, for the bundle whose own columns prove
@@ -1070,7 +1185,8 @@ struct installed_ride {
 /// Runs after every assignment, because the primary may install after the rider
 /// was visited: q10 reaches `nation` (op 10) before `customer` (op 13).
 void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
-                             std::vector<installed_ride> const& rides)
+                             std::vector<installed_ride> const& rides,
+                             std::vector<fd_edge> const& fd_edges)
 {
   if (!late_mat::late_mat_enabled() || candidates.empty()) { return; }
 
@@ -1105,6 +1221,16 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
       }
       if (primary != nullptr) {
         proof = rider_determined_by_ride(scan_op, entry, candidate.columns, *primary);
+      }
+      // Third route: the one-hop argument failed (the rider does not meet the
+      // ride's scan directly), but a CHAIN of the same argument through other
+      // cached scans might still determine this rider's row — q5/q8's
+      // customer -> nation -> region, where `region` never joins `customer`.
+      if (!proof.has_value() && primary != nullptr && late_mat::fd_chain_enabled()) {
+        auto const determined = row_determined_scans(fd_edges, primary);
+        if (determined.contains(&scan_op)) {
+          proof = "fd-chain from operator " + std::to_string(primary->get_operator_id());
+        }
       }
       if (!proof.has_value()) {
         decline(
@@ -1539,7 +1665,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(dynamic_filters));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
-  install_rider_deferrals(rider_candidates, installed_rides);
+  // FD-chain edges are only worth walking every cached scan's column
+  // lifetimes a second time for when the switch is lit; off by default, so
+  // the ordinary rider pass above pays nothing extra for this.
+  std::vector<fd_edge> fd_edges;
+  if (late_mat::fd_chain_enabled()) {
+    std::vector<fd_source> fd_sources;
+    fd_sources.reserve(cached_assignments.size());
+    for (auto const& assignment : cached_assignments) {
+      fd_sources.push_back(fd_source{assignment.op, assignment.entry, &assignment.columns});
+    }
+    fd_edges = collect_fd_edges(fd_sources);
+  }
+  install_rider_deferrals(rider_candidates, installed_rides, fd_edges);
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
 

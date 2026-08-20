@@ -110,9 +110,11 @@ inline int default_min_boundaries()
 /// The longer ride pays fixed costs the short one does not — hashing a rowid
 /// key, and a gather per group at the far end — so on a small aggregate it can
 /// cost more than the carrying it avoids. The floor is measured against the
-/// FIRST ridden aggregate's estimated input rows. Default off: on the shapes
-/// measured so far the ride wins wherever it is admissible at all, and a
-/// threshold nobody has calibrated is a way to refuse the case that pays.
+/// FIRST ridden aggregate's estimated input rows. Default off: no shape
+/// measured so far has shown a SMALL aggregate losing to the ride (see
+/// @ref max_group_by_rowid_input_rows for the opposite, measured, failure —
+/// a huge one), so a threshold nobody has calibrated here is a way to refuse
+/// the case that pays rather than the one that doesn't.
 inline std::size_t min_group_by_rowid_input_rows()
 {
   static std::size_t const value = []() -> std::size_t {
@@ -122,6 +124,35 @@ inline std::size_t min_group_by_rowid_input_rows()
     auto const* end    = v + std::strlen(v);
     auto const rc      = std::from_chars(v, end, parsed);
     return (rc.ec == std::errc{} && rc.ptr == end) ? parsed : 0;
+  }();
+  return value;
+}
+
+/// Group-input CEILING for the group-by-rowid ride, in rows
+/// (SIRIUS_EXP_LATE_MAT_GBR_MAX_GROUP_ROWS, default 1,000,000,000).
+///
+/// The opposite failure from @ref min_group_by_rowid_input_rows, and the one
+/// actually measured: TPC-H SF1000 q10's first ridden aggregate estimates
+/// 5,999,330,220 input rows (essentially unfiltered lineitem scale), and
+/// taking the extended ride there cost 13.6% versus the short stop (0.514 s
+/// vs 0.452 s, byte-identical results either way) — the fixed costs of the
+/// longer ride (hashing a rowid key, a gather per group at the far end)
+/// outweighed the bytes it stopped carrying once the pre-aggregate fan-out
+/// reached billions of rows. 1,000,000,000 sits comfortably below that and
+/// above the scale of every dimension-heavy aggregate seen so far (customer,
+/// nation, region), so it blocks lineitem/orders-scale fan-out while leaving
+/// smaller aggregates eligible. One calibration point, not a fitted curve —
+/// override via the env var, or set to 0 to disable, if a workload's shapes
+/// differ.
+inline std::size_t max_group_by_rowid_input_rows()
+{
+  static std::size_t const value = []() -> std::size_t {
+    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_GBR_MAX_GROUP_ROWS");
+    if (v == nullptr || v[0] == '\0') { return 1'000'000'000; }
+    std::size_t parsed = 0;
+    auto const* end    = v + std::strlen(v);
+    auto const rc      = std::from_chars(v, end, parsed);
+    return (rc.ec == std::errc{} && rc.ptr == end) ? parsed : 1'000'000'000;
   }();
   return value;
 }
@@ -137,6 +168,28 @@ inline bool count_on_deferred_enabled()
 {
   static bool const enabled = [] {
     char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_COUNT_DEFER");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
+/// Multi-hop functional-dependency rider chain (SIRIUS_EXP_LATE_MAT_FD_CHAIN,
+/// default OFF).
+///
+/// rider_determined_by_ride() admits a rider that meets the ride's primary
+/// scan on the two sides of ONE equality join condition, with the rider's own
+/// column proven unique. That is a ONE-HOP argument. This switch extends it to
+/// a CHAIN: scan A determines scan B's row (A meets B on one equality
+/// condition, B's column proven unique), and B in turn determines scan C's row
+/// the same way — so C is admitted as a rider even though it never joins the
+/// primary directly (q5/q8's customer -> nation -> region, q3/q12's
+/// orders -> customer chain). Each hop is the same one-hop argument applied in
+/// sequence; the chain is only as sound as every link, so an unprovable hop
+/// simply stops propagation there rather than admitting anything past it.
+inline bool fd_chain_enabled()
+{
+  static bool const enabled = [] {
+    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_FD_CHAIN");
     return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
   }();
   return enabled;

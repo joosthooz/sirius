@@ -92,6 +92,7 @@ extern "C" int cudaProfilerStop();
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
+#include "memory/pinned_reservation_guard.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
@@ -1521,6 +1522,43 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                  std::move(mat.column_storage));
     attach_proven_unique(mat.unique_verdicts);
     attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
+  }
+
+  // Pin-time watermark warning: gpu-tier pins are allocated with no
+  // reservation and are invisible to the downgrade executor, so once pins
+  // alone exceed the downgrade-stop watermark the executor can never reclaim
+  // below it — and any task reservation larger than (reservation limit −
+  // pinned bytes) will now fail fast instead of waiting forever.
+  if (data.args.tier != "host") {
+    auto const& space_configs = sirius_ctx->get_config().get_memory_space_configs();
+    for (auto const* gpu_space : gpu_spaces) {
+      std::size_t const pinned = sirius::memory::gpu_tier_pinned_bytes(scan_mgr, gpu_space);
+      for (auto const& space_config : space_configs) {
+        auto const* gpu_config =
+          std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config);
+        if (gpu_config == nullptr || gpu_config->device_id != gpu_space->get_device_id()) {
+          continue;
+        }
+        if (std::size_t const stop_watermark = gpu_config->downgrade_stop_threshold();
+            pinned > stop_watermark) {
+          SIRIUS_LOG_WARN(
+            "[pin_table] GPU {}: after pinning '{}', gpu-tier pinned bytes ({}) exceed the "
+            "downgrade-stop watermark ({} bytes = {:.2f} of the {}-byte pool). Pinned tables "
+            "are not evictable, so the downgrade executor can never reclaim below the pins; "
+            "any task reservation above {} bytes (reservation limit {} - pinned) will fail "
+            "fast. Consider tier='host' pins, unpinning tables, or a larger GPU pool.",
+            gpu_space->get_device_id(),
+            data.args.name,
+            pinned,
+            stop_watermark,
+            gpu_config->downgrade_stop_fraction,
+            gpu_config->memory_capacity,
+            sirius::memory::max_satisfiable_reservation(gpu_config->reservation_limit(), pinned),
+            gpu_config->reservation_limit());
+        }
+        break;
+      }
+    }
   }
 
   output.SetCardinality(1);

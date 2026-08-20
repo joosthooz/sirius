@@ -385,6 +385,24 @@ step trace_through(sirius_physical_operator const& node,
           if (ref->column_index == in_pos && !moved_to.has_value()) { moved_to = out; }
           continue;
         }
+        // A carrier-restore cast of a bare reference widens a narrowed
+        // physical storage type back to its logical one — it changes no
+        // value, only its bit-width (see ast::cast_kind::carrier_restore).
+        // The planner inserts these at pipeline boundaries independent of
+        // late-mat; a deferred column never carries a narrowed carrier to
+        // begin with (materialize resolves straight from the pinned entry),
+        // so this is exactly as transparent to the ride as a bare reference.
+        // materialize_at_port's restored_types check (port_materialize.cpp)
+        // still fails loudly if that assumption is ever wrong for some
+        // origin, so this cannot silently produce the wrong value.
+        if (auto const* cast_expr = std::get_if<ast::cast>(&expr->v)) {
+          if (cast_expr->kind == ast::cast_kind::carrier_restore) {
+            if (auto const* inner = std::get_if<ast::reference>(&cast_expr->child->v)) {
+              if (inner->column_index == in_pos && !moved_to.has_value()) { moved_to = out; }
+              continue;
+            }
+          }
+        }
         if (reads_column(*expr, in_pos)) { computed_with = true; }
       }
       // moved_to is nullopt when the projection simply drops the column.

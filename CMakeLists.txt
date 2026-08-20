@@ -306,6 +306,7 @@ set(EXTENSION_SOURCES
     src/log/noop_sink.cpp
     src/log/spdlog_owning_sink.cpp
     src/memory/defragmenter_oom_policy.cpp
+    src/memory/pinned_reservation_guard.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
