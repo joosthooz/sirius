@@ -257,6 +257,14 @@ target_link_libraries(
           dl)
 target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${_SIMPATICO_LIB_DIR}")
 
+# Plain-Parquet-decode throughput benchmark — a methodology-matched counterpart
+# to `simpatico benchmark` for comparing GPU ingestion compute throughput. No
+# dependency on the simpatico lib itself.
+add_executable(parquet_ingest_bench_cli cli/parquet_ingest_main.cpp)
+set_target_properties(parquet_ingest_bench_cli PROPERTIES OUTPUT_NAME
+                                                          parquet_ingest_bench)
+target_link_libraries(parquet_ingest_bench_cli PRIVATE cudf rmm cudart cuda dl)
+
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
