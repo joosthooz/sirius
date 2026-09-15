@@ -132,6 +132,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// "connection" is a file descriptor it already holds.
   virtual void warmup(std::string_view /*bucket_url*/) noexcept {}
 
+  /// Backend read counters for SIRIUS_IO_PROFILE; empty when the backend keeps
+  /// none. Reading resets, so a caller sees one query's worth.
+  [[nodiscard]] virtual std::string perf_report_and_reset() noexcept { return {}; }
+
   /// Whether this backend can serve reads for @p path.  Backends should
   /// validate scheme/protocol support and any backend-specific
   /// preconditions (e.g. file existence for local-disk backends).
@@ -207,10 +211,15 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// The cache constructs itself in an "armed" or "unarmed" state
   /// depending on @c supports_vector_host_read(); the ioctx is unaware
   /// of that distinction — it simply forwards lookups through @c cache().
+  /// Throws if the cache was asked for and could not be built. Silently
+  /// degrading here is worse than failing: the caller has already decided from
+  /// config that it wants a cache, and everything downstream treats a null cache
+  /// as "no caching configured" -- so the read path quietly loses prefetching and
+  /// range merging while the configuration that requested them still validates.
   void initialize_cache(
     cucascade::memory::memory_reservation_manager& reservation_manager,
     io::cache::config const& cache_config,
-    std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept;
+    std::shared_ptr<const sirius::memory::topology_index> topology_index);
 
   /// Tear down the cache (drains background workers and any in-flight
   /// IO via @c admission_control).  Idempotent.  The owner (scan

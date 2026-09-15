@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include <atomic>
+#include <cstdio>
 #include "compression/compressed_representation.hpp"
 
 #include <cudf/table/table.hpp>

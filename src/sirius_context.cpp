@@ -16,6 +16,8 @@
 
 #include "sirius_context.hpp"
 
+#include <iostream>
+
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
@@ -418,6 +420,17 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // below — queued tasks reach operators through their pipeline, so they must be gone before the
   // plan is destroyed. Other in-flight queries keep their queued work.
   if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+
+  // SIRIUS_IO_PROFILE: one query's worth of backend read counters. Gated because
+  // reading them resets, so an always-on read would starve whoever asked.
+  try {
+    static bool const io_profile = std::getenv("SIRIUS_IO_PROFILE") != nullptr;
+    if (io_profile && scan_manager_) {
+      auto report = scan_manager_->io_perf_report_and_reset();
+      if (!report.empty()) { std::cerr << "\n" << report << std::endl; }
+    }
+  } catch (...) {
+  }
 
   query_.reset();
 

@@ -817,6 +817,11 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
+  /// Aggregate every routed backend's read counters for SIRIUS_IO_PROFILE.
+ public:
+  [[nodiscard]] std::string io_perf_report_and_reset() noexcept;
+
+ private:
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once

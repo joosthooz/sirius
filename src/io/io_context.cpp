@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstdio>
 #include "io/io_context.hpp"
 
 #include "io/cache/config.hpp"
@@ -37,7 +38,7 @@ ioctx::~ioctx() = default;
 void ioctx::initialize_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   io::cache::config const& cache_config,
-  std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept
+  std::shared_ptr<const sirius::memory::topology_index> topology_index)
 {
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
@@ -54,11 +55,20 @@ void ioctx::initialize_cache(
     _cache = std::make_unique<cache::prefetching_cache>(
       reservation_manager, this, cache_config, std::move(topology_index));
   } catch (const std::exception& e) {
+    _cache.reset();
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: {}", e.what());
-    _cache.reset();
+    throw std::runtime_error(
+      std::string("ioctx::initialize_cache: the configured read cache could not be built: ") +
+      e.what() +
+      " -- scan_manager.cache.mode asked for a cache, so this is fatal rather than a "
+      "silent fall back to uncached reads");
   } catch (...) {
-    SIRIUS_LOG_ERROR("prefetching_cache construction failed: unknown error");
     _cache.reset();
+    SIRIUS_LOG_ERROR("prefetching_cache construction failed: unknown error");
+    throw std::runtime_error(
+      "ioctx::initialize_cache: the configured read cache could not be built (unknown error) "
+      "-- scan_manager.cache.mode asked for a cache, so this is fatal rather than a silent "
+      "fall back to uncached reads");
   }
 }
 

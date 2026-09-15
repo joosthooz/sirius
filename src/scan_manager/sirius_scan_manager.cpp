@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstdio>
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include "compression/decompression_pushdown_policy.hpp"
@@ -1863,6 +1864,20 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
   return io_ctx->open_datasource(file_path, hint);
+}
+
+std::string sirius_scan_manager::io_perf_report_and_reset() noexcept
+{
+  std::string out;
+  try {
+    if (_io_ctx) { out += _io_ctx->perf_report_and_reset(); }
+    std::lock_guard lock{_routed_io_ctxs_mtx};
+    for (auto const& [_, ctx] : _routed_io_ctxs) {
+      if (ctx) { out += ctx->perf_report_and_reset(); }
+    }
+  } catch (...) {  // observability only -- never poison query teardown
+  }
+  return out;
 }
 
 void sirius_scan_manager::list_objects_paged(

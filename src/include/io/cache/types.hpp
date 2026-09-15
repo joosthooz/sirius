@@ -322,7 +322,12 @@ class chunk_state {
 
   /// Widest extent the packed field can express, in pages.  The chunk size must
   /// stay under this many pages; @ref buffer_pool checks it at construction.
-  [[nodiscard]] static constexpr std::uint32_t max_fill_pages() noexcept { return (1U << 14) - 1; }
+  ///
+  /// 16 bits, matching chunk_fill::pages, so the limit is 255 MiB at a 4 KiB page.
+  /// It was 14 bits, which capped a chunk at 64 MiB MINUS ONE PAGE -- so the most
+  /// natural host block size to configure, exactly 64 MiB, was one page over and
+  /// aborted the cache's construction.
+  [[nodiscard]] static constexpr std::uint32_t max_fill_pages() noexcept { return (1U << 16) - 1; }
 
   chunk_state() noexcept = default;
 
@@ -565,9 +570,11 @@ class chunk_state {
   static constexpr int PIN_SHIFT            = 4;
   static constexpr std::uint64_t PIN_MASK   = 0xFFFULL << PIN_SHIFT;
   static constexpr int PAGE_SHIFT           = 16;
-  static constexpr std::uint64_t PAGE_MASK  = 0x3FFFULL << PAGE_SHIFT;
-  static constexpr std::uint64_t SIDE_BIT   = 1ULL << 30;
-  static constexpr std::uint64_t FULL_BIT   = 1ULL << 31;
+  // 16 bits (was 14). The two fill flags moved to the high half, which was unused,
+  // rather than the page count borrowing bits from pins or subscribers.
+  static constexpr std::uint64_t PAGE_MASK  = 0xFFFFULL << PAGE_SHIFT;
+  static constexpr std::uint64_t SIDE_BIT   = 1ULL << 48;
+  static constexpr std::uint64_t FULL_BIT   = 1ULL << 49;
   static constexpr std::uint64_t FILL_MASK  = PAGE_MASK | SIDE_BIT | FULL_BIT;
   static constexpr int SUB_SHIFT            = 32;
   static constexpr std::uint64_t SUB_MASK   = 0xFFFFULL << SUB_SHIFT;

@@ -379,7 +379,11 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
 }
 
 constexpr std::size_t rest_min_segment_bytes = 4UL << 20;
-constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
+// 64 MiB so a whole cache chunk fits one segment: the chunk size follows the host
+// tier's block size, and a fill larger than this is rejected outright rather than
+// split (see the fill guard below). Peak pinned staging scales with it --
+// in-flight requests x segment size -- since staging is allocated per request.
+constexpr std::size_t rest_max_segment_bytes = 64UL << 20;
 
 [[nodiscard]] std::size_t dynamic_segment_target(std::size_t backlog,
                                                  std::size_t free_connections) noexcept
@@ -958,6 +962,8 @@ struct io_slot {
   curl_slist_ptr headers;
   buf_sink sink;
   header_capture hc;
+  /// When this slot's GET was armed, for the per-request duration counter.
+  std::chrono::steady_clock::time_point started{};
 
   void reset() noexcept
   {
@@ -966,7 +972,8 @@ struct io_slot {
     headers.reset();
     sink = buf_sink{};
     hc.reset();
-    token = {};
+    token   = {};
+    started = {};
   }
 };
 
@@ -1412,6 +1419,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_WRITEDATA, &slot.sink));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &capture_header));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERDATA, &slot.hc));
+      slot.started = std::chrono::steady_clock::now();
     };
 
     int running  = 0;
@@ -1455,10 +1463,20 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           slot.reset();
         }
       }
+      // One sample per submit pass: the depth the reactor managed to reach with
+      // whatever the callers had queued. A ceiling that is never approached means
+      // the reactor is starved, not saturated.
+      note_inflight(static_cast<std::uint64_t>(inflight));
     };
 
     auto finish = [&](std::size_t index, CURLcode curl_status, long http_status) {
-      auto& slot        = slots[index];
+      auto& slot = slots[index];
+      if (slot.started != std::chrono::steady_clock::time_point{}) {
+        note_request(static_cast<std::uint64_t>(slot.sink.total_received),
+                     static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - slot.started)
+                                                  .count()));
+      }
       auto& request     = *slot.req;
       auto& op          = *request.op;
       auto const io_rng = op.io_rng;

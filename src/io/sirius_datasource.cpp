@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <atomic>
+#include <cstdio>
 #include "io/sirius_datasource.hpp"
 
 #include "exec/semi_future.hpp"

@@ -16,6 +16,9 @@
 
 #include "io/cache/prefetching_cache.hpp"
 
+#include <atomic>
+#include <cstdio>
+
 #include "cuda/device_copy_batch.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
