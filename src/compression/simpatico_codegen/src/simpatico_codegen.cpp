@@ -25,6 +25,8 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <thread>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -196,26 +198,69 @@ struct leased_pool {
 };
 
 // Submit `body(i, stream)` for every index in [0, n_items) across the pool
-// streams from the calling thread (round-robin), then synchronise all streams.
-// No worker threads are spawned: CUDA stream submission is asynchronous, so
-// the GPU can overlap column work across pool streams while the CPU submits
-// serially. All allocations happen on the calling thread, keeping
-// cuCascade's per-thread memory-reservation accounting correct.
+// streams, one CPU worker per lane, then synchronise all streams.
+//
+// This previously submitted serially from the calling thread, on the reasoning
+// that CUDA submission is asynchronous so the GPU would overlap column work by
+// itself. That only holds while `body` never blocks, and the decode path did
+// block per column, which made full-table time equal the sum of the per-column
+// times exactly -- no overlap at all, whatever the stream count. Those barriers
+// are gone now; workers additionally hide the host-side cost of walking a plan
+// and binding buffers, which submission order alone cannot.
+//
+// CAVEAT: allocations no longer all happen on the calling thread, which the
+// serial design relied on to keep cuCascade's per-thread memory-reservation
+// accounting correct. That is fine for the standalone CLI (RMM's async resource
+// is thread-safe) but must be revisited before the engine drives this path.
 template <typename Body>
 void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
 {
   size_t const n_streams = pool.streams.size();
   if (n_streams == 0) throw plan_error("stream_pool has no streams");
   std::exception_ptr first_exception;
-  for (size_t i = 0; i < n_items; ++i) {
-    rmm::cuda_stream_view s{pool.streams[i % n_streams]};
-    try {
-      body(i, s);
-    } catch (...) {
-      if (!first_exception) first_exception = std::current_exception();
-      break;
+
+  size_t const n_threads = std::min(n_streams, n_items);
+
+  if (n_threads <= 1) {
+    for (size_t i = 0; i < n_items; ++i) {
+      rmm::cuda_stream_view s{pool.streams[i % n_streams]};
+      try {
+        body(i, s);
+      } catch (...) {
+        if (!first_exception) first_exception = std::current_exception();
+        break;
+      }
+    }
+  } else {
+    // cudaSetDevice is per-thread, so each worker re-selects the submitting
+    // thread's device before touching a stream.
+    int device = 0;
+    cudaGetDevice(&device);
+    std::atomic<size_t> next{0};
+    std::mutex err_mu;
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+    for (size_t lane = 0; lane < n_threads; ++lane) {
+      workers.emplace_back([&, lane] {
+        cudaSetDevice(device);
+        rmm::cuda_stream_view s{pool.streams[lane]};
+        for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < n_items;
+             i      = next.fetch_add(1, std::memory_order_relaxed)) {
+          try {
+            body(i, s);
+          } catch (...) {
+            std::lock_guard<std::mutex> lk(err_mu);
+            if (!first_exception) first_exception = std::current_exception();
+            return;
+          }
+        }
+      });
+    }
+    for (auto& t : workers) {
+      t.join();
     }
   }
+
   cudaError_t sync_err = pool.sync_all();
   if (first_exception) std::rethrow_exception(first_exception);
   if (sync_err != cudaSuccess) {

@@ -994,7 +994,12 @@ std::unique_ptr<cudf::column> DecodeWalk::run()
     if (error_out) *error_out = "decompression completed but 'input' column not reconstructed";
     return nullptr;
   }
-  cudaStreamSynchronize(stream.value());
+  // The per-column barrier that used to sit here is gone: run_column_workers
+  // blocks on it, so with it every column completed before the next was even
+  // submitted. Callers that free inputs or rebind buffers on return must now
+  // sequence that themselves -- run_column_workers' pool.sync_all() covers the
+  // decompress_columns_parallel path. PR #1834 replaces this discipline properly
+  // with decode-frame ownership.
   auto result = std::move(root_it->second);
 
   // Generic fallback: a predicate was requested but no rep could answer it off

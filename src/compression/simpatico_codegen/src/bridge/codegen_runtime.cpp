@@ -760,8 +760,11 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
     "cuLaunchKernel failed");
   lap("launch");
 
-  SIMPATICO_CUDA_CHECK(
-    cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_ptr)), -1, "stream sync failed");
+  // No barrier here. The decode transients it used to guard are RMM async-pool
+  // allocations freed with cudaFreeAsync on this same stream, which is already
+  // stream-ordered, and the caller ends with pool.sync_all(). Worth ~1% on its
+  // own (376.4 -> 380.2 GB/s on lineitem); it is removed because it blocks the
+  // submitting thread, not because it was expensive.
   lap("sync");
   return 1;
 }
