@@ -179,6 +179,7 @@ add_library(
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
   src/operators/fsst_compressor.cu
+  src/operators/onpair_compressor.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -285,6 +286,7 @@ add_codegen_host_test(test_operator_sweep)
 add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
 add_codegen_host_test(test_multi_gpu_stream_affinity)
+add_codegen_host_test(bench_onpair_gpu)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.

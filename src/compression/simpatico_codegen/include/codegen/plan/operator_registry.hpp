@@ -34,6 +34,7 @@ enum class OpId : std::uint8_t {
   AlpRd          = 14,
   Zigzag         = 15,
   Fsst           = 18,  // FSST-GPU string codec (leaf); stable wire tag
+  OnPair         = 19,  // OnPair-GPU string codec (leaf); decode-only port, see onpair_compressor.cu
   // Structural / pre-processing ops — not serialised as leaf tags.
   Bitextract = 16,
   StrSplit   = 17,

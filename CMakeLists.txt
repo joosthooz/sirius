@@ -603,6 +603,7 @@ endif()
 
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/compression/bench_fsst_vs_default.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
