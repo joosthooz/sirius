@@ -26,6 +26,7 @@
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -249,10 +250,17 @@ class rest_reactor {
   /// injected collaborators from the plain, file-settable tunables).
   class reactor_context {
    public:
+    /// @param host_space HOST-tier space that owns @p host_mr. When given, each
+    /// reactor reserves @c config::staging_reserve_bytes of it at start and serves
+    /// staging from that reservation first.
     reactor_context(config cfg,
                     std::shared_ptr<request_authorizer> authorizer,
-                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
-      : _config(std::move(cfg)), _authorizer(std::move(authorizer)), _host_mr(host_mr)
+                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr,
+                    cucascade::memory::memory_space* host_space                 = nullptr)
+      : _config(std::move(cfg)),
+        _authorizer(std::move(authorizer)),
+        _host_mr(host_mr),
+        _host_space(host_space)
     {
     }
 
@@ -266,11 +274,16 @@ class rest_reactor {
     {
       return _host_mr;
     }
+    [[nodiscard]] cucascade::memory::memory_space* host_space() const noexcept
+    {
+      return _host_space;
+    }
 
    private:
     config _config;
     std::shared_ptr<request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
+    cucascade::memory::memory_space* _host_space{nullptr};
   };
 
   using io_object_type       = rest_io_object;
@@ -421,6 +434,82 @@ class rest_reactor {
   // Logical bytes not yet assigned to a curl slot. Retries are already claimed
   // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
+
+ public:
+  /// Per-reactor read counters, for SIRIUS_IO_PROFILE.
+  ///
+  /// What a read path costs is not visible from wall time alone: the same bytes
+  /// can arrive as a few large GETs or many small ones, and a reactor can be
+  /// saturated or starved while both look identical from outside. These record
+  /// which, so a slow scan can be attributed to request size, to concurrency, or
+  /// to neither.
+  struct io_stats {
+    std::uint64_t requests{0};       ///< ranged GETs completed (retries counted again)
+    std::uint64_t bytes{0};          ///< payload bytes delivered
+    std::uint64_t submit_events{0};  ///< in-flight samples taken, one per submit pass
+    std::uint64_t inflight_sum{0};   ///< sum of in-flight depth over those samples
+    std::uint64_t inflight_peak{0};  ///< deepest concurrency observed
+    std::uint64_t request_nanos{0};  ///< summed per-request wall time, across slots
+    std::uint64_t groups{0};         ///< grouped_io_requests enqueued
+    std::uint64_t group_slices{0};   ///< logical slices inside them
+  };
+
+  /// Snapshot the counters and zero them. Reading resets, matching the rest of
+  /// the SIRIUS_IO_PROFILE surface.
+  [[nodiscard]] io_stats stats_snapshot_and_reset() noexcept
+  {
+    io_stats out;
+    out.requests      = _stat_requests.exchange(0, std::memory_order_relaxed);
+    out.bytes         = _stat_bytes.exchange(0, std::memory_order_relaxed);
+    out.submit_events = _stat_submit_events.exchange(0, std::memory_order_relaxed);
+    out.inflight_sum  = _stat_inflight_sum.exchange(0, std::memory_order_relaxed);
+    out.inflight_peak = _stat_inflight_peak.exchange(0, std::memory_order_relaxed);
+    out.request_nanos = _stat_request_nanos.exchange(0, std::memory_order_relaxed);
+    out.groups        = _stat_groups.exchange(0, std::memory_order_relaxed);
+    out.group_slices  = _stat_group_slices.exchange(0, std::memory_order_relaxed);
+    return out;
+  }
+
+  /// Record one completed GET. Called from the worker thread only, but the
+  /// counters are atomic because the reader is whichever thread ends the query.
+  void note_request(std::uint64_t bytes, std::uint64_t nanos) noexcept
+  {
+    _stat_requests.fetch_add(1, std::memory_order_relaxed);
+    _stat_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    _stat_request_nanos.fetch_add(nanos, std::memory_order_relaxed);
+  }
+
+  /// Record the in-flight depth after a submit pass -- the number that says
+  /// whether the reactor is being kept fed.
+  /// Record one enqueued group and how many logical slices it carried. Slices per
+  /// group bounds what any coalescing could merge: a group of one has nothing to
+  /// fuse regardless of whether the ranges are adjacent.
+  /// Record one enqueued group and the logical slices it carried. Slices per group
+  /// against requests shows how much fusion the reactor achieved.
+  void note_group(std::uint64_t slices) noexcept
+  {
+    _stat_groups.fetch_add(1, std::memory_order_relaxed);
+    _stat_group_slices.fetch_add(slices, std::memory_order_relaxed);
+  }
+
+  void note_inflight(std::uint64_t depth) noexcept
+  {
+    _stat_submit_events.fetch_add(1, std::memory_order_relaxed);
+    _stat_inflight_sum.fetch_add(depth, std::memory_order_relaxed);
+    auto peak = _stat_inflight_peak.load(std::memory_order_relaxed);
+    while (depth > peak &&
+           !_stat_inflight_peak.compare_exchange_weak(peak, depth, std::memory_order_relaxed)) {}
+  }
+
+ private:
+  std::atomic<std::uint64_t> _stat_requests{0};
+  std::atomic<std::uint64_t> _stat_bytes{0};
+  std::atomic<std::uint64_t> _stat_submit_events{0};
+  std::atomic<std::uint64_t> _stat_inflight_sum{0};
+  std::atomic<std::uint64_t> _stat_inflight_peak{0};
+  std::atomic<std::uint64_t> _stat_request_nanos{0};
+  std::atomic<std::uint64_t> _stat_groups{0};
+  std::atomic<std::uint64_t> _stat_group_slices{0};
 
   std::jthread _worker;
 };

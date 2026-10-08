@@ -326,6 +326,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
+| `max_readahead_bytes` | bytes | — (unset) | Bytes the readahead may hold in prefetched splits that have landed but not yet been disposed. Unset takes the smallest prefetching budget (`cache.eviction_threshold_fraction` of the host tier) among the armed caches the query reads through; `0` means no byte bound. Accepts byte strings (`2GiB`). See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
@@ -351,6 +352,13 @@ When the readahead ends up `opportunistic` (either way), an *unset* `max_readahe
 against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
+
+`max_readahead_scans` caps IO *in flight* — a slot comes back when a prefetch lands — so on its own it
+does not bound how many landed-but-unconsumed prefetches sit pinned in the host tier.
+`max_readahead_bytes` does: the readahead holds a candidate back while issuing it would take the
+resident total past the budget, and also while any HOST memory space reports it should downgrade
+(`memory_space::should_downgrade_memory()`), until a split is disposed. With nothing resident it
+always issues, so a split larger than the budget runs alone rather than stalling.
 
 Both are resolved against a single backend: the live one publishing the widest
 `n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
@@ -384,19 +392,22 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+| `staging_reserve_bytes` | bytes | 512Mi | Pinned host bytes each REST reactor reserves from the HOST tier at start for device-read staging. Staging is drawn from this reservation first, so spills filling the shared pinned tier cannot starve reads. 0 takes no reservation. |
+| `staging_wait_timeout_ms` | int (ms) | 300000 | How long a read waits (parked on the reactor, retried with backoff and whenever a read completes) for staging to free before it fails with `rmm::out_of_memory`. 0 fails at once. |
 
 Two REST values are deliberately not YAML keys. **Connections per reactor** is
 fixed at 64 — the useful number is a property of one reactor thread, not of a
 deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread to service them. **Physical GET size** is worker-owned:
-the reactor derives a target between 4 MiB and 16 MiB from its queued logical
-bytes and currently free connections. Large contiguous requests are balanced
-under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
-cache-chunk boundaries so a chunk is never published before all of its bytes
-arrive.
+each with its own thread to service them. **Physical GET size** is worker-owned
+and capped at 16 MiB. A slice served on its own is split against a 4–16 MiB
+target derived from the reactor's queued logical bytes and free connections
+(fragmented cache fills only at whole cache-chunk boundaries, so a chunk is never
+published before all of its bytes arrive). Runs of nearby slices -- cache fills,
+populate-on-read fills and staged device reads alike -- are coalesced into one
+GET, bridging gaps of up to `merge_max_gap`; the bridged bytes are discarded.
 
-`merge_max_gap` remains a logical planner hint: nearby ranges can be represented
-as prepared slices without forcing a static physical layout. Device operations
+`merge_max_gap` therefore sets both the prefetching cache's range merging and the
+gap the worker will bridge with one GET. Device operations
 allocate as many pinned CuCascade blocks as their selected physical range needs;
 those blocks stay owned through curl retries, the asynchronous H2D copy, and its
 CUDA completion event. Staging is therefore proportional to active device work
@@ -448,7 +459,7 @@ sirius:
 |-----|------|---------|-------------|
 | `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
-| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Hard cap on the cache's resident bytes, as a fraction of the host tier. Allocations past it are refused (reads over those chunks succeed uncached) and the evictor starts once the cap is reached. `0` means uncapped. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
@@ -456,7 +467,7 @@ through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Siri
 pinned prefetching cache.
 
 `eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
-pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+pool reaches its `eviction_threshold_fraction` cap; `eviction: idle` drops each chunk as soon as
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 

@@ -207,6 +207,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  // Connections per reactor. Observed peak in-flight pins at this value
+  // regardless of reactor count or scan budget, so it has to be reachable
+  // from config to test the concurrency ceiling.
+  r.optional("max_connections", opt.max_connections, yaml::greater_than<std::size_t>{0});
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
   r.optional("stall_time_s", opt.stall_time_s);
@@ -221,6 +225,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
+  r.optional("staging_reserve_bytes", yaml::bytes(opt.staging_reserve_bytes));
+  r.optional("staging_wait_timeout_ms", opt.staging_wait_timeout);
   r.reject_unknown();
 }
 
@@ -307,6 +313,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);
   r.optional("readahead_strategy", opt.readahead_strategy);
+  r.optional("max_readahead_bytes", yaml::bytes(opt.max_readahead_bytes));
   if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);

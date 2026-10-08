@@ -77,6 +77,7 @@
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -530,6 +531,18 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   // and thereby poison the runtime — a logging or telemetry failure must not.
   try {
     SIRIUS_LOG_INFO("QueryEnd");
+  } catch (...) {
+  }
+
+  // Per-query IO counters (REST reactor reads, fused requests), gated because
+  // reading them resets them. Observability only: never let it fail the query end.
+  try {
+    static bool const io_profile = std::getenv("SIRIUS_IO_PROFILE") != nullptr;
+    if (io_profile && scan_manager_) {
+      if (auto report = scan_manager_->io_perf_report_and_reset(); !report.empty()) {
+        std::cerr << "\n" << report << std::endl;
+      }
+    }
   } catch (...) {
   }
 
