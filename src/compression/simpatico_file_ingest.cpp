@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -57,6 +58,13 @@ struct hpln_layout {
   /// False for a file written before the trailer existed, whose extent can only be found by
   /// parsing a speculative prefix. Such a file is always one chunk.
   bool located = false;
+};
+
+/// A located file plus every chunk's header: what bind parks in @ref hpln_metadata so a split's
+/// read can skip both. Immutable once built.
+struct hpln_ingest_layout {
+  hpln_layout layout;
+  std::vector<std::vector<std::uint8_t>> headers;
 };
 
 std::optional<simpatico::hpln_segment_ref> find_segment(hpln_layout const& layout,
@@ -548,8 +556,11 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
                            cucascade::memory::memory_space& host_space,
                            sizing_cache& cache)
 {
-  // One round per level of "a column has several bitpacked leaves", so a handful at most; the cap
-  // only guards against a header that never stops asking.
+  // A column with several bitpacked leaves asks for the later ones only after the earlier ones
+  // resolve, so one pass is not enough: measured on TPC-H q3, stopping after one left the rest to
+  // the blocking path and cost more than the extra pass (plan phase 17 ms -> 460 ms a split). One
+  // round per level, so a handful at most; the cap only guards against a header that never stops
+  // asking.
   constexpr int max_rounds = 8;
   cache.collect            = true;
   for (int round = 0; round < max_rounds; ++round) {
@@ -650,17 +661,41 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::span<const std::size_t> columns,
   std::span<const std::vector<std::uint32_t>> decode_chunks)
 {
+  using clock        = std::chrono::steady_clock;
+  auto const t_enter = clock::now();
+  auto const ms      = [](clock::time_point a, clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   auto src          = open_hpln(path, "hpln ingest", options);
   auto const policy = options.policy.value_or(src->default_policy());
-  auto layout       = locate_hpln(*src, path);
-  if (!layout.located) {
-    throw std::runtime_error("[hpln ingest] '" + path +
-                             "' predates the trailer and has no chunk directory; it can only be "
-                             "read as a single chunk");
+  // A bind of this file already located it and read every chunk's header; reuse that rather than
+  // paying for both again on every split. Falls back to doing it here when no bind parked them
+  // (a transport with no metadata store, or a file read without a prior bind).
+  std::shared_ptr<hpln_ingest_layout const> cached_layout;
+  if (auto const parked = src->metadata()) {
+    if (auto const* hm = dynamic_cast<hpln_metadata const*>(parked.get())) {
+      cached_layout = std::static_pointer_cast<hpln_ingest_layout const>(hm->ingest_layout());
+    }
   }
-  std::vector<std::vector<std::uint8_t>> headers;
-  simpatico::hpln_schema schema;
-  describe_chunks(*src, path, layout, policy, headers, schema);
+  hpln_ingest_layout owned_layout;
+  hpln_ingest_layout const* ingest_layout = cached_layout.get();
+  if (ingest_layout == nullptr) {
+    owned_layout.layout = locate_hpln(*src, path);
+    if (!owned_layout.layout.located) {
+      throw std::runtime_error("[hpln ingest] '" + path +
+                               "' predates the trailer and has no chunk directory; it can only "
+                               "be read as a single chunk");
+    }
+  }
+  auto const t_located = clock::now();
+  if (ingest_layout == nullptr) {
+    simpatico::hpln_schema schema;
+    describe_chunks(*src, path, owned_layout.layout, policy, owned_layout.headers, schema);
+    ingest_layout = &owned_layout;
+  }
+  auto const& layout   = ingest_layout->layout;
+  auto const& headers  = ingest_layout->headers;
+  auto const t_headers = clock::now();
 
   // Allocate every requested chunk first, then fill them all in one planned read: consecutive
   // chunks are adjacent in the payload region, so the batch collapses to a few large sequential
@@ -680,7 +715,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     prefetch_sizing_reads(
       headers, layout, chunk_ids, columns, decode_chunks, *src, policy, host_space, sizing);
   }
-  std::size_t at = 0;
+  auto const t_sized = clock::now();
+  std::size_t at     = 0;
   for (auto const id : chunk_ids) {
     if (id >= layout.chunks.size()) {
       throw std::runtime_error("[hpln ingest] '" + path + "': chunk " + std::to_string(id) +
@@ -734,7 +770,9 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     out.push_back({it->second, rows_in_blob, narrowed_ids[id]});
     ++at;
   }
+  auto const t_planned = clock::now();
   src->read_extents(std::move(extents), policy, "chunk payload");
+  auto const t_read = clock::now();
   // A narrowed read cannot be checksum-verified: the recorded CRC covers a chunk's WHOLE payload,
   // and this read deliberately did not fetch all of it.
   auto const any_narrowed =
@@ -758,7 +796,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   auto const st = src->stats();
   SIRIUS_LOG_DEBUG(
     "[hpln ingest] '{}' via {}: {} chunks of {}, {} requests, {} extents, {} B read for "
-    "{} B wanted",
+    "{} B wanted; ms: open+locate {:.1f}, headers {:.1f}, sizing {:.1f}, plan {:.1f}, payload "
+    "{:.1f}, total {:.1f}",
     path,
     st.transport,
     chunk_ids.size(),
@@ -766,7 +805,13 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     st.requests,
     st.extents,
     st.bytes_read,
-    st.bytes_wanted);
+    st.bytes_wanted,
+    ms(t_enter, t_located),
+    ms(t_located, t_headers),
+    ms(t_headers, t_sized),
+    ms(t_sized, t_planned),
+    ms(t_planned, t_read),
+    ms(t_enter, clock::now()));
   report(*src, options);
   return out;
 }
@@ -1046,7 +1091,8 @@ namespace {
 /// they do around it.
 hpln_bind_schema parse_hpln_schema(std::string const& path,
                                    hpln_open_options const& options,
-                                   hpln_source& src);
+                                   hpln_source& src,
+                                   std::shared_ptr<void const>* ingest_out = nullptr);
 
 }  // namespace
 
@@ -1059,11 +1105,13 @@ std::shared_ptr<hpln_bind_schema const> read_hpln_schema_shared(std::string cons
       return hm->schema();
     }
   }
-  auto schema = std::make_shared<hpln_bind_schema const>(parse_hpln_schema(path, options, *src));
+  std::shared_ptr<void const> ingest;
+  auto schema =
+    std::make_shared<hpln_bind_schema const>(parse_hpln_schema(path, options, *src, &ingest));
   // Best effort: a transport with nowhere to park it simply re-parses next time, which is slower
   // and not wrong. Racing binds of the same file both parse and the last one wins -- the entries
   // are equal, so there is nothing to reconcile.
-  src->store_metadata(std::make_shared<hpln_metadata>(schema));
+  src->store_metadata(std::make_shared<hpln_metadata>(schema, std::move(ingest)));
   return schema;
 }
 
@@ -1077,7 +1125,8 @@ namespace {
 
 hpln_bind_schema parse_hpln_schema(std::string const& path,
                                    hpln_open_options const& options,
-                                   hpln_source& src)
+                                   hpln_source& src,
+                                   std::shared_ptr<void const>* ingest_out)
 {
   // Reuses the ingest reader for locating and parsing, but stops before any payload is staged:
   // binding a query must not move data. Every chunk's header is parsed -- one sequential read of
@@ -1115,6 +1164,10 @@ hpln_bind_schema parse_hpln_schema(std::string const& path,
         SIRIUS_LOG_WARN(
           "[hpln schema] '{}': zone maps unreadable ({}); binding unpruned", path, zerr);
       }
+    }
+    if (ingest_out != nullptr) {
+      *ingest_out =
+        std::make_shared<hpln_ingest_layout const>(hpln_ingest_layout{layout, std::move(headers)});
     }
   } else {
     // Pre-trailer file: parse the header from the front, growing the prefix as needed.

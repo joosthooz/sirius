@@ -141,8 +141,9 @@ struct hpln_bind_schema {
 /// immutable once parsed, so no consumer needs its own copy.
 class hpln_metadata final : public sirius::io::io_object_metadata {
  public:
-  explicit hpln_metadata(std::shared_ptr<hpln_bind_schema const> schema)
-    : _schema(std::move(schema))
+  explicit hpln_metadata(std::shared_ptr<hpln_bind_schema const> schema,
+                         std::shared_ptr<void const> ingest_layout = nullptr)
+    : _schema(std::move(schema)), _ingest_layout(std::move(ingest_layout))
   {
   }
 
@@ -151,8 +152,22 @@ class hpln_metadata final : public sirius::io::io_object_metadata {
     return _schema;
   }
 
+  /// The file's located layout and chunk headers, as the ingest reader wants them. Opaque outside
+  /// simpatico_file_ingest.cpp, which is the only place that knows the type. Null when the bind
+  /// that parked this did not capture it, in which case a split locates the file itself.
+  ///
+  /// Bind already read and CRC-verified every chunk header to build the schema; handing them on
+  /// means a split's read does not pay again, per split, for the tail read that locates the file
+  /// and the round trip that re-reads the headers -- ~0.2-0.35 s a split over S3, spent inside
+  /// the scan task while it holds its GPU reservation.
+  [[nodiscard]] std::shared_ptr<void const> const& ingest_layout() const noexcept
+  {
+    return _ingest_layout;
+  }
+
  private:
   std::shared_ptr<hpln_bind_schema const> _schema;
+  std::shared_ptr<void const> _ingest_layout;
 };
 
 /// Open @p path far enough to answer "what columns does this file have".
