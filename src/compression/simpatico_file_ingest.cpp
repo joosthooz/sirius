@@ -25,8 +25,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -402,6 +404,22 @@ std::shared_ptr<pinned_compressed_blob> allocate_chunk_columns(
   return blob;
 }
 
+/// The small sizing buffers a narrowed read needs, keyed by their FILE range.
+///
+/// Sizing one chunk blocks on a read per buffer, and a scan stages tens of chunks, so over an
+/// object store those reads -- one round trip each, strictly one after another -- cost far more
+/// than the bytes they spare. They are instead collected first and fetched as one planned batch:
+/// a collecting pass records every range it is asked for (and answers "unavailable", which only
+/// makes that column look unsubsettable for the moment), the misses are read together, and the
+/// pass repeats until nothing is missing. Which ranges a chunk asks for never depends on the
+/// values read, so this converges in a round or two; a range still absent afterwards is simply
+/// read the old way.
+struct sizing_cache {
+  std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::uint8_t>> bytes;
+  std::set<std::pair<std::uint64_t, std::uint64_t>> missing;
+  bool collect = false;
+};
+
 /// Stage @p chunk narrowed to @p columns and/or @p decode_chunks, reading only the bytes that
 /// survive BOTH.
 ///
@@ -425,7 +443,8 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
                              hpln_io_policy const& policy,
                              cucascade::memory::memory_space& host_space,
                              std::vector<hpln_extent>& out_extents,
-                             std::shared_ptr<pinned_compressed_blob>& out_blob)
+                             std::shared_ptr<pinned_compressed_blob>& out_blob,
+                             sizing_cache* cache = nullptr)
 {
   out_blob.reset();
 
@@ -459,23 +478,35 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
         gather_columns.empty() ? want : simpatico::compose_gathers(gather_columns, want);
       if (ranges.empty()) { return false; }
       for (auto const& r : ranges) {
-        auto const bytes = src.read_range(chunk.payload_offset + r.src_offset, r.size, "sizing");
+        auto const file_off = chunk.payload_offset + r.src_offset;
+        if (cache != nullptr) {
+          auto const hit = cache->bytes.find({file_off, r.size});
+          if (hit != cache->bytes.end()) {
+            std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, hit->second.data(), r.size);
+            continue;
+          }
+          if (cache->collect) {
+            cache->missing.insert({file_off, r.size});
+            return false;
+          }
+        }
+        auto const bytes = src.read_range(file_off, r.size, "sizing");
         if (bytes.size() != r.size) { return false; }
         std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, bytes.data(), r.size);
       }
       return true;
     };
-  if (auto const err = simpatico::build_chunk_subset_header(working_header,
-                                                            decode_chunks,
-                                                            read_payload,
-                                                            narrowed_header,
-                                                            gather_rows,
-                                                            /*max_gap_bytes=*/0,
-                                                            &payload_bytes,
-                                                            &subsetted);
-      !err.empty()) {
-    return false;
-  }
+  auto const subset_err = simpatico::build_chunk_subset_header(working_header,
+                                                               decode_chunks,
+                                                               read_payload,
+                                                               narrowed_header,
+                                                               gather_rows,
+                                                               /*max_gap_bytes=*/0,
+                                                               &payload_bytes,
+                                                               &subsetted);
+  // A collecting pass only wanted the ranges asked for; its header is built on stand-in answers.
+  if (cache != nullptr && cache->collect) { return false; }
+  if (!subset_err.empty()) { return false; }
   // A column emitted WHOLE beside compacted ones has a different row count, and the two cannot be
   // one cudf::table. Every column here is one this scan reads, so any refusal refuses the chunk.
   for (auto const flag : subsetted) {
@@ -503,6 +534,61 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
   static_cast<void>(policy);
   out_blob = std::move(blob);
   return true;
+}
+
+/// Fetch every sizing buffer the narrowed chunks in @p chunk_ids will ask for, as planned batches
+/// rather than one blocking read each. See @ref sizing_cache.
+void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers,
+                           hpln_layout const& layout,
+                           std::span<const std::size_t> chunk_ids,
+                           std::span<const std::size_t> columns,
+                           std::span<const std::vector<std::uint32_t>> decode_chunks,
+                           hpln_source& src,
+                           hpln_io_policy const& policy,
+                           cucascade::memory::memory_space& host_space,
+                           sizing_cache& cache)
+{
+  // One round per level of "a column has several bitpacked leaves", so a handful at most; the cap
+  // only guards against a header that never stops asking.
+  constexpr int max_rounds = 8;
+  cache.collect            = true;
+  for (int round = 0; round < max_rounds; ++round) {
+    cache.missing.clear();
+    std::set<std::size_t> seen;
+    for (std::size_t at = 0; at < chunk_ids.size(); ++at) {
+      auto const id = chunk_ids[at];
+      // A chunk named twice is staged once, with its first occurrence's rows.
+      if (id >= layout.chunks.size() || !seen.insert(id).second) { continue; }
+      if (at >= decode_chunks.size() || decode_chunks[at].empty()) { continue; }
+      std::vector<hpln_extent> unused;
+      std::shared_ptr<pinned_compressed_blob> blob;
+      allocate_chunk_narrowed(headers[id],
+                              layout.chunks[id],
+                              columns,
+                              decode_chunks[at],
+                              src,
+                              policy,
+                              host_space,
+                              unused,
+                              blob,
+                              &cache);
+    }
+    if (cache.missing.empty()) { break; }
+    std::vector<hpln_extent> extents;
+    extents.reserve(cache.missing.size());
+    for (auto const& [off, size] : cache.missing) {
+      // std::map nodes do not move, so the pointer stays valid as the map grows.
+      auto& buf = cache.bytes[{off, size}];
+      buf.resize(size);
+      hpln_extent e;
+      e.offset = off;
+      e.dst.push_back({buf.data(), size});
+      extents.push_back(std::move(e));
+    }
+    src.read_extents(std::move(extents), policy, "sizing");
+  }
+  cache.collect = false;
+  cache.missing.clear();
 }
 
 /// Open @p path for reading, through @p options's io_context when it has one.
@@ -589,6 +675,11 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   // destinations are how a range silently lands in the wrong place.
   std::unordered_map<std::size_t, std::shared_ptr<pinned_compressed_blob>> staged;
   std::unordered_map<std::size_t, bool> narrowed_ids;
+  sizing_cache sizing;
+  if (std::ranges::any_of(decode_chunks, [](auto const& d) { return !d.empty(); })) {
+    prefetch_sizing_reads(
+      headers, layout, chunk_ids, columns, decode_chunks, *src, policy, host_space, sizing);
+  }
   std::size_t at = 0;
   for (auto const id : chunk_ids) {
     if (id >= layout.chunks.size()) {
@@ -606,8 +697,16 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
                           ? std::span<const std::uint32_t>{decode_chunks[at]}
                           : std::span<const std::uint32_t>{};
       if (!rows.empty()) {
-        narrowed = allocate_chunk_narrowed(
-          headers[id], layout.chunks[id], columns, rows, *src, policy, host_space, extents, blob);
+        narrowed = allocate_chunk_narrowed(headers[id],
+                                           layout.chunks[id],
+                                           columns,
+                                           rows,
+                                           *src,
+                                           policy,
+                                           host_space,
+                                           extents,
+                                           blob,
+                                           &sizing);
       }
       if (!blob) {
         blob = columns.empty()
