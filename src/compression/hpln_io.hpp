@@ -43,6 +43,10 @@
 #include <string_view>
 #include <vector>
 
+namespace sirius::io {
+class sirius_datasource;
+}  // namespace sirius::io
+
 namespace sirius {
 
 //===----------------------------------------------------------------------===//
@@ -237,8 +241,15 @@ class hpln_source {
 ///
 /// @p who names the caller in error messages. Throws std::runtime_error if the file cannot be
 /// opened or its size cannot be resolved.
-[[nodiscard]] std::unique_ptr<hpln_source> open_hpln_source(std::string const& path,
-                                                            std::shared_ptr<io::ioctx> io_ctx,
-                                                            char const* who);
+///
+/// @p datasource, when given, is read through INSTEAD of opening a fresh one. That is what lets a
+/// scan split's reads land in the prefetching cache: the cache hands out its staged chunks through
+/// the datasource that holds the request's handle, so a read through any other datasource of the
+/// same file misses it however well the bytes were prefetched.
+[[nodiscard]] std::unique_ptr<hpln_source> open_hpln_source(
+  std::string const& path,
+  std::shared_ptr<io::ioctx> io_ctx,
+  char const* who,
+  std::shared_ptr<io::sirius_datasource> datasource = nullptr);
 
 }  // namespace sirius

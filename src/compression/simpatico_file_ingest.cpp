@@ -412,22 +412,6 @@ std::shared_ptr<pinned_compressed_blob> allocate_chunk_columns(
   return blob;
 }
 
-/// The small sizing buffers a narrowed read needs, keyed by their FILE range.
-///
-/// Sizing one chunk blocks on a read per buffer, and a scan stages tens of chunks, so over an
-/// object store those reads -- one round trip each, strictly one after another -- cost far more
-/// than the bytes they spare. They are instead collected first and fetched as one planned batch:
-/// a collecting pass records every range it is asked for (and answers "unavailable", which only
-/// makes that column look unsubsettable for the moment), the misses are read together, and the
-/// pass repeats until nothing is missing. Which ranges a chunk asks for never depends on the
-/// values read, so this converges in a round or two; a range still absent afterwards is simply
-/// read the old way.
-struct sizing_cache {
-  std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::uint8_t>> bytes;
-  std::set<std::pair<std::uint64_t, std::uint64_t>> missing;
-  bool collect = false;
-};
-
 /// Stage @p chunk narrowed to @p columns and/or @p decode_chunks, reading only the bytes that
 /// survive BOTH.
 ///
@@ -447,12 +431,13 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
                              simpatico::hpln_chunk_ref const& chunk,
                              std::span<const std::size_t> columns,
                              std::span<const std::uint32_t> decode_chunks,
-                             hpln_source& src,
+                             hpln_source* src,
                              hpln_io_policy const& policy,
-                             cucascade::memory::memory_space& host_space,
+                             cucascade::memory::memory_space* host_space,
                              std::vector<hpln_extent>& out_extents,
                              std::shared_ptr<pinned_compressed_blob>& out_blob,
-                             sizing_cache* cache = nullptr)
+                             hpln_sizing_cache* cache               = nullptr,
+                             std::vector<hpln_file_range>* plan_out = nullptr)
 {
   out_blob.reset();
 
@@ -498,7 +483,10 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
             return false;
           }
         }
-        auto const bytes = src.read_range(file_off, r.size, "sizing");
+        // Planning must never block on a read: a range nobody fetched ahead simply means the
+        // chunk cannot be planned, and the caller does not hint it.
+        if (src == nullptr || plan_out != nullptr) { return false; }
+        auto const bytes = src->read_range(file_off, r.size, "sizing");
         if (bytes.size() != r.size) { return false; }
         std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, bytes.data(), r.size);
       }
@@ -524,13 +512,20 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
   auto const file_ranges = simpatico::compose_gathers(gather_columns, gather_rows);
   if (file_ranges.empty() && payload_bytes > 0) { return false; }
 
-  auto* host_mr = host_space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  if (plan_out != nullptr) {
+    for (auto const& g : file_ranges) {
+      plan_out->push_back({chunk.payload_offset + g.src_offset, g.size});
+    }
+    return true;
+  }
+
+  auto* host_mr = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   if (host_mr == nullptr) {
     throw std::runtime_error("[hpln ingest] target host space has no host memory resource");
   }
   auto blob           = std::make_shared<pinned_compressed_blob>();
   blob->header        = std::move(narrowed_header);
-  auto payload_res    = host_space.make_reservation_or_null(payload_bytes);
+  auto payload_res    = host_space->make_reservation_or_null(payload_bytes);
   blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes, payload_res.get());
   blob->payload_bytes = payload_bytes;
   for (auto const& g : file_ranges) {
@@ -545,7 +540,7 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
 }
 
 /// Fetch every sizing buffer the narrowed chunks in @p chunk_ids will ask for, as planned batches
-/// rather than one blocking read each. See @ref sizing_cache.
+/// rather than one blocking read each. See @ref hpln_sizing_cache.
 void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers,
                            hpln_layout const& layout,
                            std::span<const std::size_t> chunk_ids,
@@ -553,8 +548,7 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
                            std::span<const std::vector<std::uint32_t>> decode_chunks,
                            hpln_source& src,
                            hpln_io_policy const& policy,
-                           cucascade::memory::memory_space& host_space,
-                           sizing_cache& cache)
+                           hpln_sizing_cache& cache)
 {
   // A column with several bitpacked leaves asks for the later ones only after the earlier ones
   // resolve, so one pass is not enough: measured on TPC-H q3, stopping after one left the rest to
@@ -577,9 +571,9 @@ void prefetch_sizing_reads(std::vector<std::vector<std::uint8_t>> const& headers
                               layout.chunks[id],
                               columns,
                               decode_chunks[at],
-                              src,
+                              &src,
                               policy,
-                              host_space,
+                              nullptr,
                               unused,
                               blob,
                               &cache);
@@ -607,7 +601,7 @@ std::unique_ptr<hpln_source> open_hpln(std::string const& path,
                                        char const* who,
                                        hpln_open_options const& options)
 {
-  return open_hpln_source(path, options.io_ctx, who);
+  return open_hpln_source(path, options.io_ctx, who, options.datasource);
 }
 
 /// CRC32C over a staged chunk payload, walking the pinned blocks in file order.
@@ -710,10 +704,17 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   // destinations are how a range silently lands in the wrong place.
   std::unordered_map<std::size_t, std::shared_ptr<pinned_compressed_blob>> staged;
   std::unordered_map<std::size_t, bool> narrowed_ids;
-  sizing_cache sizing;
-  if (std::ranges::any_of(decode_chunks, [](auto const& d) { return !d.empty(); })) {
-    prefetch_sizing_reads(
-      headers, layout, chunk_ids, columns, decode_chunks, *src, policy, host_space, sizing);
+  // A scan hands in the sizing buffers it already fetched for every split at once, and they are
+  // used as they are -- this read inserts nothing, so tasks can share the cache unlocked. Without
+  // one, fetch this read's own.
+  hpln_sizing_cache local_sizing;
+  hpln_sizing_cache* sizing = options.sizing.get();
+  if (sizing == nullptr) {
+    sizing = &local_sizing;
+    if (std::ranges::any_of(decode_chunks, [](auto const& d) { return !d.empty(); })) {
+      prefetch_sizing_reads(
+        headers, layout, chunk_ids, columns, decode_chunks, *src, policy, *sizing);
+    }
   }
   auto const t_sized = clock::now();
   std::size_t at     = 0;
@@ -737,12 +738,12 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
                                            layout.chunks[id],
                                            columns,
                                            rows,
-                                           *src,
+                                           src.get(),
                                            policy,
-                                           host_space,
+                                           &host_space,
                                            extents,
                                            blob,
-                                           &sizing);
+                                           sizing);
       }
       if (!blob) {
         blob = columns.empty()
@@ -814,6 +815,127 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     ms(t_enter, clock::now()));
   report(*src, options);
   return out;
+}
+
+//===----------------------------------------------------------------------===//
+// read planning
+//===----------------------------------------------------------------------===//
+struct hpln_read_planner::impl {
+  std::string path;
+  hpln_open_options options;
+  std::vector<std::size_t> columns;
+  std::unique_ptr<hpln_source> src;
+  hpln_io_policy policy;
+  std::shared_ptr<hpln_ingest_layout const> layout;
+  std::shared_ptr<hpln_sizing_cache> sizing = std::make_shared<hpln_sizing_cache>();
+};
+
+hpln_read_planner::hpln_read_planner(std::string path,
+                                     hpln_open_options options,
+                                     std::vector<std::size_t> columns)
+  : _impl(std::make_unique<impl>())
+{
+  _impl->path    = std::move(path);
+  _impl->options = std::move(options);
+  _impl->columns = std::move(columns);
+  _impl->src     = open_hpln(_impl->path, "hpln plan", _impl->options);
+  _impl->policy  = _impl->options.policy.value_or(_impl->src->default_policy());
+  // The layout a bind parked, when there is one -- the same reuse a split's read makes.
+  if (auto const parked = _impl->src->metadata()) {
+    if (auto const* hm = dynamic_cast<hpln_metadata const*>(parked.get())) {
+      _impl->layout = std::static_pointer_cast<hpln_ingest_layout const>(hm->ingest_layout());
+    }
+  }
+  if (!_impl->layout) {
+    auto fresh    = std::make_shared<hpln_ingest_layout>();
+    fresh->layout = locate_hpln(*_impl->src, _impl->path);
+    if (!fresh->layout.located) {
+      throw std::runtime_error("[hpln plan] '" + _impl->path +
+                               "' predates the trailer and has no chunk directory");
+    }
+    simpatico::hpln_schema schema;
+    describe_chunks(*_impl->src, _impl->path, fresh->layout, _impl->policy, fresh->headers, schema);
+    _impl->layout = std::move(fresh);
+  }
+}
+
+hpln_read_planner::~hpln_read_planner() = default;
+
+std::shared_ptr<hpln_sizing_cache> const& hpln_read_planner::sizing() const noexcept
+{
+  return _impl->sizing;
+}
+
+void hpln_read_planner::prefetch_sizing(std::span<const std::size_t> chunk_ids,
+                                        std::span<const std::vector<std::uint32_t>> decode_chunks)
+{
+  if (!std::ranges::any_of(decode_chunks, [](auto const& d) { return !d.empty(); })) { return; }
+  prefetch_sizing_reads(_impl->layout->headers,
+                        _impl->layout->layout,
+                        chunk_ids,
+                        _impl->columns,
+                        decode_chunks,
+                        *_impl->src,
+                        _impl->policy,
+                        *_impl->sizing);
+}
+
+std::vector<hpln_file_range> hpln_read_planner::ranges(
+  std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const
+{
+  auto const& layout  = _impl->layout->layout;
+  auto const& headers = _impl->layout->headers;
+  if (chunk_id >= layout.chunks.size()) { return {}; }
+  auto const& chunk = layout.chunks[chunk_id];
+
+  // The same three cases the read walks through, in the same order: narrowed to rows, narrowed to
+  // columns, or the whole chunk.
+  std::vector<hpln_file_range> out;
+  if (!decode_chunks.empty()) {
+    std::vector<hpln_extent> unused;
+    std::shared_ptr<pinned_compressed_blob> blob;
+    if (!allocate_chunk_narrowed(headers[chunk_id],
+                                 chunk,
+                                 _impl->columns,
+                                 decode_chunks,
+                                 nullptr,
+                                 _impl->policy,
+                                 nullptr,
+                                 unused,
+                                 blob,
+                                 _impl->sizing.get(),
+                                 &out)) {
+      // Not knowable without a read (or refused): leave it unhinted rather than guess.
+      return {};
+    }
+  } else if (_impl->columns.empty()) {
+    if (chunk.payload_bytes > 0) { out.push_back({chunk.payload_offset, chunk.payload_bytes}); }
+  } else {
+    std::vector<std::uint8_t> subset_header;
+    std::vector<simpatico::gather_range> gather;
+    std::uint64_t payload_bytes = 0;
+    if (!simpatico::build_column_subset_header(
+           headers[chunk_id], _impl->columns, subset_header, gather, &payload_bytes)
+           .empty()) {
+      return {};
+    }
+    for (auto const& g : gather) {
+      out.push_back({chunk.payload_offset + g.src_offset, g.size});
+    }
+  }
+
+  std::ranges::sort(out, {}, &hpln_file_range::offset);
+  std::vector<hpln_file_range> merged;
+  for (auto const& r : out) {
+    if (r.size == 0) { continue; }
+    if (!merged.empty() && r.offset <= merged.back().offset + merged.back().size) {
+      auto const end     = std::max(merged.back().offset + merged.back().size, r.offset + r.size);
+      merged.back().size = end - merged.back().offset;
+    } else {
+      merged.push_back(r);
+    }
+  }
+  return merged;
 }
 
 ingested_hpln read_hpln_into_pinned(std::string const& path,

@@ -32,6 +32,7 @@
 
 // sirius
 #include <compression/compressed_scan.hpp>
+#include <compression/simpatico_file_ingest.hpp>
 #include <helper/logical_type.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -210,6 +211,10 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
  */
 class simpatico_scan_info : public scan_info {
  public:
+  simpatico_scan_info() = default;
+  /// A split that tells the prefetching cache what it is about to read -- see @ref ranges.
+  explicit simpatico_scan_info(std::vector<fadvise_entry> hints) : scan_info(std::move(hints)) {}
+
   std::string path;
   /// Backend this split reads through, resolved once on the walk. Carried on the split rather
   /// than read from a member so a concurrent walk and materialize never race for it.
@@ -225,6 +230,14 @@ class simpatico_scan_info : public scan_info {
   std::int64_t num_rows = 0;
   /// Decoded size of the columns this split produces; drives the memory reservation.
   std::size_t decoded_bytes = 0;
+  /// The file bytes this split's read will fetch, as the planner worked them out. Accumulated by
+  /// the coalescer, which turns them into the batch's fadvise hint; see
+  /// @ref sirius::hpln_read_planner.
+  std::vector<sirius::hpln_file_range> ranges;
+  /// The datasource carrying this batch's prefetch request. The read goes through it, because the
+  /// cache hands out what it prefetched only to the datasource that holds the request. Null when
+  /// the batch was not hinted, in which case the read opens its own.
+  std::shared_ptr<io::sirius_datasource> datasource;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override { return decoded_bytes; }
 };
@@ -377,6 +390,11 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// Decide, once, which chunks survive the file's zone maps and which of their decode chunks do.
   void plan_pruning();
 
+  /// Builds @ref _planner and fetches the sizing buffers every narrowed chunk needs, once, so the
+  /// splits can be hinted to the prefetching cache and no task has to read them. Best effort: any
+  /// failure leaves the scan working exactly as it did, just unhinted.
+  void plan_prefetch();
+
   /// Report what the walk dropped, once the decision is made.
   void log_pruning() const;
 
@@ -412,6 +430,12 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// handed to two of them would be emitted twice -- which shows up as a plausible row count, not
   /// as a failure.
   std::atomic<std::size_t> _next_chunk{0};
+
+  /// Plans each split's reads so they can be prefetched; null when the scan has no io_context to
+  /// prefetch through (a local read) or planning failed, and every split is then simply unhinted.
+  std::shared_ptr<sirius::hpln_read_planner> _planner;
+  /// The datasource each batch's own is duplicated from: same file, no prefetch request.
+  std::shared_ptr<io::sirius_datasource const> _base_datasource;
 };
 
 [[nodiscard]] std::shared_ptr<simpatico_gpu_ingestible> make_ingestible(

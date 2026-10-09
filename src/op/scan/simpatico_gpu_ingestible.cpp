@@ -21,6 +21,7 @@
 #include <compression/simpatico_file_ingest.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/owning_table_view.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
@@ -30,6 +31,7 @@
 
 // cudf
 #include <cudf/concatenate.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -43,6 +45,7 @@
 
 // standard library
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -85,7 +88,10 @@ std::size_t estimate_decoded_bytes(simpatico_ingestible_table_info const& info,
 /// size_type rows cannot be concatenated into one table at all.
 class simpatico_batch_coalescer : public batch_coalescer {
  public:
-  explicit simpatico_batch_coalescer(std::size_t cap) : _cap(cap) {}
+  simpatico_batch_coalescer(std::size_t cap, std::shared_ptr<io::sirius_datasource const> base)
+    : _cap(cap), _base(std::move(base))
+  {
+  }
 
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
@@ -97,7 +103,7 @@ class simpatico_batch_coalescer : public batch_coalescer {
     bool const byte_cap_hit =
       _current && _cap > 0 && _current->decoded_bytes + split->decoded_bytes > _cap;
     bool const row_cap_hit = _current && _current->num_rows + split->num_rows > kCudfMaxRows;
-    if (byte_cap_hit || row_cap_hit) { out.push_back(std::move(_current)); }
+    if (byte_cap_hit || row_cap_hit) { out.push_back(seal(std::move(_current))); }
 
     if (!_current) {
       _current       = std::make_unique<simpatico_scan_info>();
@@ -127,18 +133,61 @@ class simpatico_batch_coalescer : public batch_coalescer {
     }
     _current->num_rows += split->num_rows;
     _current->decoded_bytes += split->decoded_bytes;
+    _current->ranges.insert(_current->ranges.end(), split->ranges.begin(), split->ranges.end());
     return out;
   }
 
   std::vector<std::unique_ptr<scan_info>> flush() override
   {
     std::vector<std::unique_ptr<scan_info>> out;
-    if (_current) { out.push_back(std::move(_current)); }
+    if (_current) { out.push_back(seal(std::move(_current))); }
     return out;
   }
 
  private:
+  /// Turn a finished batch into the split the scan runs: with a prefetch hint for the bytes its
+  /// read will fetch, so the cache pulls them in before the task is scheduled rather than the task
+  /// waiting on them while it holds its reservation. Each batch gets a datasource of its own
+  /// because the prefetch request is per-datasource state -- the same reason parquet duplicates
+  /// one per slice. A batch with nothing to hint, or a scan with no cache to hint, is returned as
+  /// it is.
+  [[nodiscard]] std::unique_ptr<scan_info> seal(std::unique_ptr<simpatico_scan_info> batch) const
+  {
+    if (!_base || batch->ranges.empty()) { return batch; }
+    std::sort(batch->ranges.begin(), batch->ranges.end(), [](auto const& a, auto const& b) {
+      return a.offset < b.offset;
+    });
+    std::vector<cudf::io::text::byte_range_info> hint_ranges;
+    std::uint64_t cur_begin = batch->ranges.front().offset;
+    std::uint64_t cur_end   = cur_begin;
+    for (auto const& r : batch->ranges) {
+      if (r.offset > cur_end) {
+        hint_ranges.emplace_back(static_cast<std::size_t>(cur_begin),
+                                 static_cast<std::size_t>(cur_end - cur_begin));
+        cur_begin = r.offset;
+      }
+      cur_end = std::max(cur_end, r.offset + r.size);
+    }
+    hint_ranges.emplace_back(static_cast<std::size_t>(cur_begin),
+                             static_cast<std::size_t>(cur_end - cur_begin));
+
+    std::shared_ptr<io::sirius_datasource> datasource{_base->duplicate()};
+    std::vector<scan_info::fadvise_entry> hints;
+    hints.push_back({datasource, std::move(hint_ranges)});
+    auto sealed           = std::make_unique<simpatico_scan_info>(std::move(hints));
+    sealed->path          = std::move(batch->path);
+    sealed->io_ctx        = std::move(batch->io_ctx);
+    sealed->chunk_ids     = std::move(batch->chunk_ids);
+    sealed->decode_chunks = std::move(batch->decode_chunks);
+    sealed->num_rows      = batch->num_rows;
+    sealed->decoded_bytes = batch->decoded_bytes;
+    sealed->datasource    = std::move(datasource);
+    sealed->set_contract_payload(batch->contract_id(), {}, {});
+    return sealed;
+  }
+
   std::size_t _cap;
+  std::shared_ptr<io::sirius_datasource const> _base;
   std::unique_ptr<simpatico_scan_info> _current;
 };
 
@@ -330,6 +379,7 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
   }
 
   plan_pruning();
+  plan_prefetch();
 }
 
 //===----------------------------------------------------------------------===//
@@ -509,6 +559,45 @@ void simpatico_gpu_ingestible::plan_pruning()
   log_pruning();
 }
 
+void simpatico_gpu_ingestible::plan_prefetch()
+{
+  // Without an io_context the read is a local file read and there is no cache to hint.
+  if (!_info->io_ctx || _live_chunks.empty()) { return; }
+  auto const& path = _info->resolved_file_paths.front();
+  try {
+    auto const t0 = std::chrono::steady_clock::now();
+    sirius::hpln_open_options options;
+    options.io_ctx = _info->io_ctx;
+    auto planner   = std::make_shared<sirius::hpln_read_planner>(path, options, _staged_columns);
+    std::vector<std::size_t> ids;
+    std::vector<std::vector<std::uint32_t>> rows;
+    ids.reserve(_live_chunks.size());
+    rows.reserve(_live_chunks.size());
+    for (auto const& live : _live_chunks) {
+      ids.push_back(live.id);
+      rows.push_back(live.decode_chunks);
+    }
+    planner->prefetch_sizing(ids, rows);
+    std::shared_ptr<io::sirius_datasource const> base{_info->io_ctx->open_datasource(path)};
+    if (!base) { return; }
+    _planner         = std::move(planner);
+    _base_datasource = std::move(base);
+    SIRIUS_LOG_DEBUG(
+      "[simpatico_gpu_ingestible] '{}': planned reads for {} chunks in {:.1f} ms",
+      path,
+      _live_chunks.size(),
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN(
+      "[simpatico_gpu_ingestible] '{}': read planning failed ({}); the scan runs "
+      "without prefetch hints",
+      path,
+      e.what());
+    _planner.reset();
+    _base_datasource.reset();
+  }
+}
+
 simpatico_gpu_ingestible::~simpatico_gpu_ingestible() = default;
 
 //===----------------------------------------------------------------------===//
@@ -556,6 +645,18 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
     // decode will actually return rather than by the chunk it came from.
     split->num_rows      = live.num_rows;
     split->decoded_bytes = estimate_decoded_bytes(*_info, split->num_rows);
+    // What this chunk's read will fetch, for the prefetch hint the coalescer builds. Planning only
+    // ever costs a miss, so a failure here leaves the split unhinted rather than failing the scan.
+    if (_planner) {
+      try {
+        split->ranges = _planner->ranges(live.id, live.decode_chunks);
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN("[simpatico_gpu_ingestible] '{}': chunk {} left unhinted: {}",
+                        split->path,
+                        live.id,
+                        e.what());
+      }
+    }
     // The scan operator rejects a split not stamped with its scan's contract. A .hpln split
     // carries no per-slice materializer certificates: the file's trailer is re-read per split.
     split->set_contract_payload(_info->contract_id, {}, {});
@@ -603,6 +704,11 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // file read plus one decode rather than a decode and a re-compress.
   sirius::hpln_open_options options;
   options.io_ctx = split.io_ctx;
+  // Through the datasource that carries this batch's prefetch request, so what the cache already
+  // fetched is served to this read rather than fetched again -- and with the sizing buffers the
+  // scan fetched once up front, so no task pays for them.
+  options.datasource = split.datasource;
+  if (_planner) { options.sizing = _planner->sizing(); }
   // The surviving decode chunks go INTO the read, so a chunk that whole-chunk pruning kept but its
   // group bounds mostly rule out costs only its surviving bytes. Narrowing after the read -- which
   // is what this did, and what a host pin still does because its bytes are already resident --
@@ -765,8 +871,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     }
     // Re-point the decoded buffers onto `stream`: they were produced on pool streams, while the
     // concatenate below and everything downstream are ordered by `stream`.
-    decoded.push_back(
-      sirius::rebind_table_stream(std::move(result.table), stream));
+    decoded.push_back(sirius::rebind_table_stream(std::move(result.table), stream));
   }
 
   // The fetches above only ENQUEUED their H2D copies, and the pinned staging blobs die with this
@@ -810,7 +915,8 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
 //===----------------------------------------------------------------------===//
 std::unique_ptr<batch_coalescer> simpatico_gpu_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<simpatico_batch_coalescer>(_info->approximate_batch_size);
+  return std::make_unique<simpatico_batch_coalescer>(_info->approximate_batch_size,
+                                                     _base_datasource);
 }
 
 //===----------------------------------------------------------------------===//

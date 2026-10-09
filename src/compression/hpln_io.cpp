@@ -278,14 +278,17 @@ char const* backend_name(io::io_context_type type)
 /// ranged reads the zone maps decide on in front of an object store.
 class ioctx_hpln_source final : public hpln_source {
  public:
-  ioctx_hpln_source(std::string path, std::shared_ptr<io::ioctx> io_ctx, char const* who)
-    : _path(std::move(path)), _io_ctx(std::move(io_ctx))
+  ioctx_hpln_source(std::string path,
+                    std::shared_ptr<io::ioctx> io_ctx,
+                    char const* who,
+                    std::shared_ptr<io::sirius_datasource> datasource)
+    : _path(std::move(path)), _io_ctx(std::move(io_ctx)), _ds(std::move(datasource))
   {
     if (!_io_ctx) {
       throw std::runtime_error(std::string("[") + who + "] '" + _path + "': null io_context");
     }
     try {
-      _ds = _io_ctx->open_datasource(_path);
+      if (!_ds) { _ds = _io_ctx->open_datasource(_path); }
     } catch (std::exception const& e) {
       throw std::runtime_error(std::string("[") + who + "] cannot open '" + _path +
                                "' through the " + backend_name(_io_ctx->type()) +
@@ -379,7 +382,7 @@ class ioctx_hpln_source final : public hpln_source {
 
   std::string _path;
   std::shared_ptr<io::ioctx> _io_ctx;
-  std::unique_ptr<io::sirius_datasource> _ds;
+  std::shared_ptr<io::sirius_datasource> _ds;
   std::uint64_t _size = 0;
 };
 
@@ -387,9 +390,12 @@ class ioctx_hpln_source final : public hpln_source {
 
 std::unique_ptr<hpln_source> open_hpln_source(std::string const& path,
                                               std::shared_ptr<io::ioctx> io_ctx,
-                                              char const* who)
+                                              char const* who,
+                                              std::shared_ptr<io::sirius_datasource> datasource)
 {
-  if (io_ctx) { return std::make_unique<ioctx_hpln_source>(path, std::move(io_ctx), who); }
+  if (io_ctx) {
+    return std::make_unique<ioctx_hpln_source>(path, std::move(io_ctx), who, std::move(datasource));
+  }
   if (has_uri_scheme(path)) {
     throw std::runtime_error(std::string("[") + who + "] '" + path +
                              "' names a remote object but no io_context was supplied; a scheme "

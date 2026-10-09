@@ -39,8 +39,10 @@
 #include <duckdb/common/vector.hpp>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -57,9 +59,43 @@ namespace sirius {
 /// `SIRIUS_HPLN_VERIFY_PAYLOAD` in the environment, read once.
 [[nodiscard]] bool hpln_verify_payload_default();
 
+/// The small sizing buffers a narrowed read needs, keyed by their FILE range.
+///
+/// Sizing one chunk blocks on a read per buffer, and a scan stages tens of chunks, so over an
+/// object store those reads -- one round trip each, strictly one after another -- cost far more
+/// than the bytes they spare. They are instead collected first and fetched as one planned batch:
+/// a collecting pass records every range it is asked for (and answers "unavailable", which only
+/// makes that column look unsubsettable for the moment), the misses are read together, and the
+/// pass repeats until nothing is missing. Which ranges a chunk asks for never depends on the
+/// values read, so this converges in a round or two; a range still absent afterwards is simply
+/// read the old way.
+///
+/// A scan fetches these once, up front, and hands the same cache to every split's read, so no
+/// task spends its time (and its GPU reservation) on them. It is read-only once fetched: the
+/// readers never insert, which is what makes sharing it between tasks safe without a lock.
+class hpln_sizing_cache {
+ public:
+  std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::uint8_t>> bytes;
+  std::set<std::pair<std::uint64_t, std::uint64_t>> missing;
+  bool collect = false;
+};
+
+/// A byte range of a .hpln file.
+struct hpln_file_range {
+  std::uint64_t offset = 0;
+  std::uint64_t size   = 0;
+};
+
 struct hpln_open_options {
   /// Backend serving this path. Null means the local filesystem.
   std::shared_ptr<io::ioctx> io_ctx;
+  /// Read through this datasource instead of opening one. A scan split reads through the
+  /// datasource that carries its prefetch request, because that is the only one whose reads are
+  /// served from the cache the request filled. Ignored without an @ref io_ctx.
+  std::shared_ptr<io::sirius_datasource> datasource;
+  /// Sizing buffers fetched ahead of the read. When set, the read uses them as they are and never
+  /// fetches or inserts; when null, the read fetches its own.
+  std::shared_ptr<hpln_sizing_cache> sizing;
   /// How reads are coalesced into requests. Unset takes the opened source's
   /// @ref hpln_source::default_policy, which differs between local files and object stores.
   std::optional<hpln_io_policy> policy;
@@ -290,6 +326,44 @@ class hpln_table_writer {
   hpln_open_options const& options                          = {},
   std::span<const std::size_t> columns                      = {},
   std::span<const std::vector<std::uint32_t>> decode_chunks = {});
+
+/// Works out, for a scan over one .hpln, exactly which bytes each chunk's read will fetch -- so a
+/// scan can tell the prefetching cache before the read happens, as a parquet scan does.
+///
+/// The ranges are computed by the same narrowing the read itself performs (the same column subset,
+/// the same surviving decode chunks, the same sizing buffers), so a hint and the read it hints
+/// cannot disagree about what a chunk needs. A hint that is wrong would only cost a miss -- the
+/// cache serves what it has and the read fetches the rest -- but there is no reason to guess.
+class hpln_read_planner {
+ public:
+  /// Locates @p path (or takes the layout a bind parked) and keeps what it needs to plan reads of
+  /// @p columns, which has the meaning it has for @ref read_hpln_chunks_into_pinned: empty is the
+  /// whole chunk. @p options carries the io_context. Throws like an open does.
+  hpln_read_planner(std::string path, hpln_open_options options, std::vector<std::size_t> columns);
+  ~hpln_read_planner();
+  hpln_read_planner(hpln_read_planner const&)            = delete;
+  hpln_read_planner& operator=(hpln_read_planner const&) = delete;
+
+  /// The sizing buffers this planner fetched, to be passed on as @ref hpln_open_options::sizing.
+  [[nodiscard]] std::shared_ptr<hpln_sizing_cache> const& sizing() const noexcept;
+
+  /// Fetch the sizing buffers every narrowed chunk in @p chunk_ids needs, as planned batches.
+  /// Positional like @ref read_hpln_chunks_into_pinned's @c decode_chunks. Call once, before any
+  /// @ref ranges and before the cache is shared; not thread-safe.
+  void prefetch_sizing(std::span<const std::size_t> chunk_ids,
+                       std::span<const std::vector<std::uint32_t>> decode_chunks);
+
+  /// The merged, ascending file ranges the read of @p chunk_id narrowed to @p decode_chunks (empty:
+  /// the whole chunk) will fetch. Empty when that cannot be known without a read -- a narrowed
+  /// chunk whose sizing buffers are not in @ref sizing -- in which case the scan simply does not
+  /// hint it. Never reads, and safe to call from several threads once @ref prefetch_sizing is done.
+  [[nodiscard]] std::vector<hpln_file_range> ranges(
+    std::size_t chunk_id, std::span<const std::uint32_t> decode_chunks) const;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
 
 /// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.
 ///
