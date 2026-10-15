@@ -71,6 +71,46 @@
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
 
+namespace {
+
+/**
+ * @brief Returns true when cuDF's AST computes exactly the DECIMAL type the planner assigned to
+ * @p alt, so the function can be evaluated through the AST.
+ *
+ * Since 26.10 (rapidsai/cudf#21996) the cuDF AST evaluates DECIMAL32 and DECIMAL64 arithmetic,
+ * including intermediate results. Unlike cudf::binary_operation, the AST takes no output type: both
+ * operands must share one decimal storage type, and the result keeps that storage type with a scale
+ * derived from the operand scales (the finer scale for `+` and `-`, the sum of the scales for `*`).
+ * Only those three operators qualify, and only when the derived type equals the planned type.
+ * DECIMAL128 stays on the binary-operation path because the AST keeps intermediates in 64 bits.
+ */
+bool ast_computes_planned_decimal_type(sirius::ast::function_call const& alt)
+{
+  auto const planned_type = try_get_cudf_type(alt.return_type());
+  if (!planned_type || (planned_type->id() != cudf::type_id::DECIMAL32 &&
+                        planned_type->id() != cudf::type_id::DECIMAL64)) {
+    return false;
+  }
+  auto const& args = alt.arguments();
+  if (args.size() != 2) { return false; }
+  auto const left_type  = try_get_cudf_type(args[0]->return_type());
+  auto const right_type = try_get_cudf_type(args[1]->return_type());
+  if (!left_type || !right_type) { return false; }
+  if (left_type->id() != planned_type->id() || right_type->id() != planned_type->id()) {
+    return false;
+  }
+  int32_t ast_scale = 0;
+  switch (alt.function()) {
+    case function_id::add:
+    case function_id::sub: ast_scale = std::min(left_type->scale(), right_type->scale()); break;
+    case function_id::mul: ast_scale = left_type->scale() + right_type->scale(); break;
+    default: return false;
+  }
+  return ast_scale == planned_type->scale();
+}
+
+}  // namespace
+
 like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
   std::string_view pattern)
 {
@@ -91,12 +131,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   auto const resolved_id = alt.function();
   auto const& args       = alt.arguments();
 
-  // Disable AST mode when the output type is decimal — cuDF ASTs choke on
-  // intermediate decimal results currently.
-  // TODO: Remove this special-case once Sirius pins cuDF >= 26.10 (cuDF PR
-  // https://github.com/rapidsai/cudf/pull/21996 merged after the 26.08 cut,
-  // so the fix will ship in 26.10).
-  auto const skip_ast      = alt.return_type().id() == sirius::type_id::DECIMAL;
+  // A DECIMAL result takes the AST only when the AST yields the planned type exactly.
+  auto const skip_ast =
+    alt.return_type().id() == sirius::type_id::DECIMAL && !ast_computes_planned_decimal_type(alt);
   auto const ast_supported = !skip_ast && std::find(supported_ast_functions.begin(),
                                                     supported_ast_functions.end(),
                                                     resolved_id) != supported_ast_functions.end();

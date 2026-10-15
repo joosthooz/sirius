@@ -1326,9 +1326,9 @@ TEMPLATE_TEST_CASE("evaluate arithmetic functions",
 }
 
 // ---------------------------------------------------------------------------
-// Decimal arithmetic (MATERIALIZE path — AST is disabled for decimal return
-// types pending cudf#21996, so all decimal function evaluation flows through
-// cudf::binary_operation on fixed_point columns/scalars).
+// Decimal arithmetic. Under the AST strategies DECIMAL32/DECIMAL64 `+`, `-` and `*` run in the
+// cuDF AST when it yields the planned result type; DECIMAL128 and everything else flows through
+// cudf::binary_operation on fixed_point columns/scalars.
 // ---------------------------------------------------------------------------
 
 TEMPLATE_TEST_CASE("evaluate decimal arithmetic (DECIMAL64)",
@@ -1466,11 +1466,9 @@ TEMPLATE_TEST_CASE("evaluate nested decimal arithmetic (col + 1.00) * 2",
                    ast_interpret_strategy,
                    ast_jit_strategy)
 {
-  // Regression coverage: before disabling AST for decimal-returning functions,
-  // nested decimal arithmetic would feed intermediate fixed_point results into
-  // the cudf AST kernel and trip cudf#21996. With AST disabled for decimal
-  // return types, the inner `+` materializes via cudf::binary_operation and the
-  // outer `*` consumes the materialized column via another cudf::binary_operation.
+  // Regression coverage for intermediate DECIMAL results in the cuDF AST (rapidsai/cudf#21996).
+  // Under the AST strategies the inner `+` stays in the AST as a DECIMAL64 intermediate that the
+  // outer `*` consumes. Under MATERIALIZE both run as cudf::binary_operation.
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
   REQUIRE(space != nullptr);
