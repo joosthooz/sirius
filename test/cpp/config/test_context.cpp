@@ -144,7 +144,8 @@ TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]"
   constexpr std::array settings{"expression_evaluator_strategy",
                                 "enable_regex_jit_impl",
                                 "enable_duckdb_fallback",
-                                "like_swar_fastpath"};
+                                "like_swar_fastpath",
+                                "enable_runtime_distinct_build_probe"};
   for (auto const* name : settings) {
     CAPTURE(name);
     auto result =
@@ -219,7 +220,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
-    REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
@@ -247,9 +247,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET fuse_merge_pipelines = false");
-    REQUIRE(result != nullptr);
-    REQUIRE(result->HasError());
-    result = con.Query("SET enable_runtime_distinct_build_probe = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET enable_dense_count_join = false");
@@ -287,7 +284,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
-    REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
@@ -310,7 +306,6 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
-    REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
@@ -402,17 +397,17 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   }
 }
 
-TEST_CASE("Sirius configuration keeps runtime distinct-build probing internal", "[sirius][config]")
+TEST_CASE("Sirius configuration accepts the runtime distinct-build probe switch",
+          "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
 
+  REQUIRE(sirius::operator_params{}.enable_runtime_distinct_build_probe);
+
   sirius::sirius_config config;
-  REQUIRE_THROWS_WITH(config.load_from_file(data_dir / "invalid_runtime_distinct_build_probe.yaml"),
-                      Catch::Matchers::ContainsSubstring(
-                        "sirius.operator_params.enable_runtime_distinct_build_probe") &&
-                        Catch::Matchers::ContainsSubstring("removed") &&
-                        Catch::Matchers::ContainsSubstring("remove this key"));
+  config.load_from_file(data_dir / "runtime_distinct_build_probe_disabled.yaml");
+  REQUIRE_FALSE(config.get_operator_params().enable_runtime_distinct_build_probe);
 }
 
 TEST_CASE("DuckDB setting preserves the Sirius log backend when sink construction fails",
@@ -1426,7 +1421,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
       current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
       current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
-      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT
+      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT,
+      current_setting('enable_runtime_distinct_build_probe')::BOOLEAN
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1454,6 +1450,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(19, 0).GetValue<double>() == Approx(0.4));
   REQUIRE(settings->GetValue(20, 0).GetValue<bool>());
   REQUIRE(settings->GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
+  REQUIRE_FALSE(settings->GetValue(22, 0).GetValue<bool>());
+  REQUIRE_FALSE(sirius_ctx->get_config().get_operator_params().enable_runtime_distinct_build_probe);
 
   for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
     auto rejected =

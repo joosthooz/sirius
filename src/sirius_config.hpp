@@ -101,9 +101,9 @@ struct valid_domain_coverage_threshold {
 /// uniqueness, which only a declared PRIMARY KEY on a catalog table can supply. The runtime test is
 /// one cudf::distinct_count pass over the build keys, taken only in BUILD_PROBE mode.
 ///
-/// Temporarily off by default (issue #1600): cudf::distinct_count can hit a cuCollections bug
-/// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
-constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
+/// It was off by default while cudf::distinct_count could read out of bounds on some key
+/// distributions (issue #1600, NVIDIA/cuCollections#834). libcudf 26.10 ships the fix.
+constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = true;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
@@ -174,11 +174,10 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Engine-owned policy: when enabled and the planner could not prove build-key uniqueness, test
-  /// it at runtime (one cudf::distinct_count pass over the build keys) and take the single-pass
-  /// cudf::distinct_hash_join when the keys are distinct. Temporarily disabled pending issue #1600.
-  /// BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. Tests retain
-  /// direct programmatic control of this field to exercise both implementations. See
+  /// When the planner could not prove build-key uniqueness, test it at runtime (one
+  /// cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
+  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 

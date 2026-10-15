@@ -372,12 +372,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
              yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
-  if (r.has("enable_runtime_distinct_build_probe")) {
-    throw std::runtime_error(
-      "'sirius.operator_params.enable_runtime_distinct_build_probe': removed; runtime distinct "
-      "build probing is an internal join policy (temporarily disabled pending issue #1600); "
-      "remove this key");
-  }
+  r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
   r.optional("max_dynamic_filter_bloom_bytes_per_gpu",

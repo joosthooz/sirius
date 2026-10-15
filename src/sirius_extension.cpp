@@ -3292,13 +3292,17 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(true),
                     SetFuseMergePipelines);
-  add_sirius_option(config,
-                    option_visibility::internal,
-                    "enable_runtime_distinct_build_probe",
-                    "toggle the internal runtime distinct-build probe",
-                    LogicalType::BOOLEAN,
-                    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
-                    SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(
+    config,
+    option_visibility::user,
+    "enable_runtime_distinct_build_probe",
+    "For BUILD_PROBE hash joins whose build-key uniqueness the planner could not prove, test "
+    "distinctness at runtime (one cudf::distinct_count pass over the cached build) and take the "
+    "single-pass cudf::distinct_hash_join instead of the general two-pass join when the keys are "
+    "distinct",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
+    SetEnableRuntimeDistinctBuildProbe);
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_dense_count_join",

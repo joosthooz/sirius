@@ -27,6 +27,7 @@ sirius:
     max_build_hash_table_bytes: 6MiB
     max_broadcast_join_size: 7MiB
     mark_join_build_switch_ratio: 3.0
+    enable_runtime_distinct_build_probe: false
     enable_dynamic_filter: false
     enable_dynamic_filter_multi_partition: true
     max_dynamic_filter_bloom_bytes_per_gpu: 17MiB
