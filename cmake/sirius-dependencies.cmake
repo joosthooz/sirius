@@ -1,5 +1,12 @@
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+# libcudf 26.10's <cudf/ast/expressions.hpp> uses std::variant without including <variant>
+# (the nightly regression from #1649, fixed upstream after the 26.10 cut). Many public cuDF headers
+# include it transitively, so pre-include <variant> in every translation unit that links cudf
+# instead of patching each include site. Drop this once a fixed libcudf ships.
+if(cudf_VERSION VERSION_GREATER_EQUAL 26.10 AND cudf_VERSION VERSION_LESS 26.12)
+  target_compile_options(cudf::cudf INTERFACE "$<$<COMPILE_LANGUAGE:CXX,CUDA>:SHELL:-include variant>")
+endif()
 find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
@@ -59,9 +66,9 @@ else()
   include(FetchContent)
   FetchContent_Declare(
     cuco
-    URL https://github.com/NVIDIA/cuCollections/archive/4b26118c99866221f99f35f4e3bc74afdbe063bc.tar.gz
+    URL https://github.com/NVIDIA/cuCollections/archive/8ed532dc0ba3ba664d1d41027269908ddcde04c8.tar.gz
     URL_HASH
-      SHA256=cfff0dfe8552ca2a8e3c53d04c26ab4d95364d14c159aaf8a37b3971b78b609d
+      SHA256=676f95da52d8ac6a6b3f494b33757112755322685d010dfa30779e200b412ec6
     SOURCE_SUBDIR do-not-build)
   FetchContent_MakeAvailable(cuco)
   # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
