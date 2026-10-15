@@ -29,7 +29,9 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -186,7 +188,15 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
   std::string arrow_schema;
   for (auto const& entry : parsed->key_value_metadata) {
     if (entry.key == "ARROW:schema") {
-      arrow_schema = entry.value;
+      // cuDF 26.12 made KeyValue::value optional, matching the Thrift schema. The generic lambda
+      // keeps the branch for the other cuDF version uninstantiated.
+      arrow_schema = [](auto const& value) -> std::string {
+        if constexpr (std::is_same_v<std::decay_t<decltype(value)>, std::string>) {
+          return value;
+        } else {
+          return value.value_or(std::string{});
+        }
+      }(entry.value);
       break;
     }
   }

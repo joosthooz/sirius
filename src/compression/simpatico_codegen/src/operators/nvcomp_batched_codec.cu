@@ -83,7 +83,7 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
     h_comp_ptrs[i] = static_cast<std::uint8_t*>(scratch.data()) + i * out_stride;
 
   std::size_t temp_bytes = 0;
-  check(ops.compress_get_temp_size(num_chunks, chunk, &temp_bytes, n_bytes),
+  check(ops.compress_get_temp_size(num_chunks, chunk, &temp_bytes, n_bytes, s),
         "compress_get_temp_size");
   rmm::device_buffer temp(temp_bytes, stream, mr);
 
@@ -274,7 +274,7 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
     "H2D uncomp ptrs");
 
   std::size_t temp_bytes = 0;
-  check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes),
+  check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes, s),
         "decompress_get_temp_size");
   rmm::device_buffer temp(temp_bytes, stream, mr);
 

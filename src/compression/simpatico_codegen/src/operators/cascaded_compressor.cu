@@ -43,7 +43,7 @@ namespace {
 
 constexpr size_t kCascadedManagerChunkSize = 64 * 1024;
 
-nvcompType_t cascaded_type_for(cudf::data_type t)
+[[maybe_unused]] nvcompType_t cascaded_type_for(cudf::data_type t)
 {
   switch (t.id()) {
     case cudf::type_id::INT8:
@@ -71,6 +71,31 @@ nvcompType_t cascaded_type_for(cudf::data_type t)
   }
 }
 
+// Build the compress options for the plan's (deltas, RLEs, bp) knobs. nvCOMP 6 replaced these knobs
+// with a new Cascaded format (asymmetric/symmetric modes and encoding masks) that has no one-to-one
+// mapping, so the knob-driven codec is not available there yet.
+nvcompBatchedCascadedCompressOpts_t make_cascaded_compress_opts(cudf::data_type dtype,
+                                                                int num_deltas,
+                                                                int num_RLEs,
+                                                                int use_bp)
+{
+#if NVCOMP_VER_MAJOR >= 6
+  (void)dtype;
+  (void)num_deltas;
+  (void)num_RLEs;
+  (void)use_bp;
+  throw std::runtime_error(
+    "nvcomp_cascaded: not implemented for nvCOMP 6 (the (deltas, RLEs, bp) options were removed)");
+#else
+  nvcompBatchedCascadedCompressOpts_t copts = nvcompBatchedCascadedCompressDefaultOpts;
+  copts.type                                = cascaded_type_for(dtype);
+  copts.num_deltas                          = num_deltas;
+  copts.num_RLEs                            = num_RLEs;
+  copts.use_bp                              = use_bp;
+  return copts;
+#endif
+}
+
 // Build the batched ops for a specific Cascaded configuration. Cascaded's opts
 // depend on the column dtype and the plan's (deltas, RLEs, bp) knobs, so ops are
 // built per call rather than cached in a static.
@@ -80,8 +105,9 @@ detail::batched_codec_ops make_cascaded_ops(nvcompBatchedCascadedCompressOpts_t 
 
   detail::batched_codec_ops o;
   o.chunk_size             = kCascadedManagerChunkSize;
-  o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-    return nvcompBatchedCascadedCompressGetTempSizeAsync(nc, mc, copts, tb, mt);
+  o.compress_get_temp_size = [copts](size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t s) {
+    return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+      nvcompBatchedCascadedCompressGet, nc, mc, copts, tb, mt, s);
   };
   o.compress_get_max_output = [copts](size_t mc, size_t* mo) {
     return nvcompBatchedCascadedCompressGetMaxOutputChunkSize(mc, copts, mo);
@@ -98,8 +124,10 @@ detail::batched_codec_ops make_cascaded_ops(nvcompBatchedCascadedCompressOpts_t 
                              cudaStream_t s) {
     return nvcompBatchedCascadedCompressAsync(up, ub, mc, nc, t, tb, cp, cb, copts, st, s);
   };
-  o.decompress_get_temp_size = [dopts](size_t nc, size_t mc, size_t* tb, size_t mt) {
-    return nvcompBatchedCascadedDecompressGetTempSizeAsync(nc, mc, dopts, tb, mt);
+  o.decompress_get_temp_size = [dopts](
+                                 size_t nc, size_t mc, size_t* tb, size_t mt, cudaStream_t s) {
+    return SIMPATICO_NVCOMP_GET_TEMP_SIZE(
+      nvcompBatchedCascadedDecompressGet, nc, mc, dopts, tb, mt, s);
   };
   o.decompress_async = [dopts](void const* const* cp,
                                size_t const* cb,
@@ -149,11 +177,8 @@ std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
       original_type, num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
   }
 
-  nvcompBatchedCascadedCompressOpts_t copts = nvcompBatchedCascadedCompressDefaultOpts;
-  copts.type                                = cascaded_type_for(original_type);
-  copts.num_deltas                          = compress_num_deltas;
-  copts.num_RLEs                            = compress_num_RLEs;
-  copts.use_bp                              = compress_use_bp;
+  nvcompBatchedCascadedCompressOpts_t const copts = make_cascaded_compress_opts(
+    original_type, compress_num_deltas, compress_num_RLEs, compress_use_bp);
 
   return detail::nvcomp_decompress_impl(
     make_cascaded_ops(copts), payload_data(), payload_size(), original_type, num_rows, stream, mr);
@@ -184,11 +209,8 @@ std::unique_ptr<compressed_representation> cascaded_compressor::compress(
 
   size_t const uncompressed_size = static_cast<size_t>(n) * cudf::size_of(dt);
 
-  nvcompBatchedCascadedCompressOpts_t copts = nvcompBatchedCascadedCompressDefaultOpts;
-  copts.type                                = cascaded_type_for(dt);
-  copts.num_deltas                          = num_deltas_;
-  copts.num_RLEs                            = num_RLEs_;
-  copts.use_bp                              = use_bp_;
+  nvcompBatchedCascadedCompressOpts_t const copts =
+    make_cascaded_compress_opts(dt, num_deltas_, num_RLEs_, use_bp_);
 
   auto [comp_buf, actual_size] =
     detail::nvcomp_compress_impl(make_cascaded_ops(copts), column_to_compress, stream, mr);

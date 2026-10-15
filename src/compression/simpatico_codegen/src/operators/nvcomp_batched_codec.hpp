@@ -28,12 +28,26 @@
 #include <cuda_runtime.h>
 
 #include <nvcomp/shared_types.h>
+#include <nvcomp/version.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <utility>
+
+// nvCOMP 6 renamed the batched `...GetTempSizeAsync` queries to `...GetTempSize` and added a stream
+// argument (the query still enqueues no work). `prefix` is the query name up to and including
+// `Get`, e.g. `nvcompBatchedLZ4CompressGet`.
+#if NVCOMP_VER_MAJOR >= 6
+#define SIMPATICO_NVCOMP_GET_TEMP_SIZE(                          \
+  prefix, num_chunks, max_chunk, opts, temp_bytes, max_total, s) \
+  prefix##TempSize(num_chunks, max_chunk, opts, temp_bytes, max_total, s)
+#else
+#define SIMPATICO_NVCOMP_GET_TEMP_SIZE(                          \
+  prefix, num_chunks, max_chunk, opts, temp_bytes, max_total, s) \
+  prefix##TempSizeAsync(num_chunks, max_chunk, opts, temp_bytes, max_total)
+#endif
 
 namespace simpatico {
 namespace detail {
@@ -42,7 +56,7 @@ namespace detail {
 inline constexpr std::size_t kFrameAlign = 256;
 
 // Type-erased bundle of a codec's batched entry points, with opts pre-bound.
-// Pure functions of their arguments (no stream/device state), so a single
+// Pure functions of their arguments (no device state), so a single
 // instance is safe to share across threads and calls.
 struct batched_codec_ops {
   std::size_t chunk_size = 64 * 1024;  // uncompressed bytes per chunk
@@ -50,7 +64,8 @@ struct batched_codec_ops {
   std::function<nvcompStatus_t(std::size_t num_chunks,
                                std::size_t max_uncomp_chunk,
                                std::size_t* temp_bytes,
-                               std::size_t max_total_uncomp)>
+                               std::size_t max_total_uncomp,
+                               cudaStream_t stream)>
     compress_get_temp_size;
 
   std::function<nvcompStatus_t(std::size_t max_uncomp_chunk, std::size_t* max_out)>
@@ -71,7 +86,8 @@ struct batched_codec_ops {
   std::function<nvcompStatus_t(std::size_t num_chunks,
                                std::size_t max_uncomp_chunk,
                                std::size_t* temp_bytes,
-                               std::size_t max_total_uncomp)>
+                               std::size_t max_total_uncomp,
+                               cudaStream_t stream)>
     decompress_get_temp_size;
 
   std::function<nvcompStatus_t(void const* const* comp_ptrs,
