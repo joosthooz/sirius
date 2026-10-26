@@ -1560,15 +1560,25 @@ void sirius_scan_manager::prepare_for_query(
   {
     std::vector<backend_readahead_policy> backend_policies;
     backend_policies.reserve(query_io_ctxs.size());
+    // The resident-byte bound an unset `max_readahead_bytes` defers to: the
+    // tightest cap (max_host_fraction) among the caches this query reads into.
+    std::size_t cache_resident_budget = 0;
     for (auto const& io_ctx : query_io_ctxs) {
       // Nowhere to read ahead into on this backend, so it has no say in the
       // readahead's terms.
       if (!io_ctx->can_use_prefetching_cache()) { continue; }
       backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
                                   .strategy = backend_prefetch_strategy(io_ctx->type())});
+      if (auto* cache = io_ctx->cache(); cache != nullptr && cache->is_armed()) {
+        if (auto const bytes = cache->max_resident_bytes(); bytes > 0) {
+          cache_resident_budget =
+            cache_resident_budget == 0 ? bytes : std::min(cache_resident_budget, bytes);
+        }
+      }
     }
     auto const backend = select_readahead_backend(backend_policies);
-    auto const plan    = _config.resolve_readahead(backend.budget, backend.strategy);
+    auto const plan =
+      _config.resolve_readahead(backend.budget, backend.strategy, cache_resident_budget);
 
     if (plan.budget > 0) {
       // Registers its mailbox for the query's lifetime; unregistered in reset().
@@ -1576,6 +1586,7 @@ void sirius_scan_manager::prepare_for_query(
                                                                   plan.budget,
                                                                   _shared_readahead_budget,
                                                                   _config.max_readahead_scans,
+                                                                  plan.max_resident_bytes,
                                                                   _physical_counters);
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);

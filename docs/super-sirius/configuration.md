@@ -337,6 +337,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
+| `max_readahead_bytes` | bytes | — (unset) | Bytes the readahead may hold in prefetched splits not yet disposed. Unset takes the smallest cache cap (`cache.max_host_fraction` of the host tier) among the query's armed caches; `0` means no byte bound. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
@@ -362,6 +363,10 @@ When the readahead ends up `opportunistic` (either way), an *unset* `max_readahe
 against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
+
+`max_readahead_scans` caps IO in flight; `max_readahead_bytes` caps the bytes held by prefetches
+that have landed but whose split is not yet disposed. With nothing resident it always issues, so
+a split larger than the budget runs alone.
 
 A query's local policy is selected from the serving backend publishing the widest budget.
 A runtime budget additionally accounts for every backend touched by each split across all
@@ -461,7 +466,7 @@ sirius:
 |-----|------|---------|-------------|
 | `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
-| `max_host_fraction` | double [0,1] | 0.8 | Hard cap on the cache's resident bytes, as a fraction of the host tier: allocations past it are refused (those reads are served uncached) and the evictor starts at it. `0` means uncapped. The former name `eviction_threshold_fraction` is still accepted as a deprecated alias (with a warning); giving both is an error. |
+| `max_host_fraction` | double [0,1] | 0.8 | Hard cap on the cache's resident bytes, as a fraction of the host tier: allocations past it are refused (those reads are served uncached) and the evictor starts at it. `0` means uncapped. The former name `max_host_fraction` is still accepted as a deprecated alias (with a warning); giving both is an error. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
