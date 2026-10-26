@@ -82,8 +82,20 @@ void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        decode_frame& frame,
-                                        char const* out_dtype = nullptr);
+                                        decode_frame& frame);
+
+/// As @ref launch_decode_fused_tree_compacted, but each survivor is stored as ``out_dtype``, a
+/// wider element type than ``dtype`` (e.g. "int64_t" for a DECIMAL32 column restored to
+/// DECIMAL64), so the caller needs no separate widening cast. Null ``out_dtype`` stores ``dtype``.
+void launch_decode_fused_tree_compacted_widened(codegen::jit::FusedTree const& tree,
+                                                codegen::jit::LabeledBuffers const& labeled,
+                                                char const* dtype,
+                                                std::int64_t num_rows,
+                                                ::sirius::codegen::selection_mask const& mask,
+                                                row_enumeration rows,
+                                                void* out,
+                                                decode_frame& frame,
+                                                char const* out_dtype);
 
 /// Dictionary gather: for dictionary->bitpack string columns with
 /// CONSTANT-WIDTH, null-free keys.  ``tree`` is the codes

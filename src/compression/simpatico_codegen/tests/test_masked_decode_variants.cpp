@@ -1578,17 +1578,22 @@ bool run_widened_output(int arch)
     CUdeviceptr d_out = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(Wide));
     // 0xAB in every byte: a kernel that wrote only the low 32 bits would leave the high half set.
     cudaMemset(reinterpret_cast<void*>(d_out), 0xAB, survivors * sizeof(Wide));
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*bp,
-                                                              enc.buffers,
-                                                              "int32_t",
-                                                              n,
-                                                              sm,
-                                                              walks[walk_idx],
-                                                              reinterpret_cast<void*>(d_out),
-                                                              stream,
-                                                              "int64_t"),
-                "[widened/%s] compacted launch failed",
-                walk_names[walk_idx]);
+    {
+      // completed_decode appends the frame last; the widened launch takes out_dtype after it.
+      std::array const streams{stream};
+      simpatico::decode_session session{streams, rmm::mr::get_current_device_resource_ref()};
+      auto& frame = simpatico::decode_session_test_access::frame(session);
+      simpatico::launch_decode_fused_tree_compacted_widened(*bp,
+                                                            enc.buffers,
+                                                            "int32_t",
+                                                            n,
+                                                            sm,
+                                                            walks[walk_idx],
+                                                            reinterpret_cast<void*>(d_out),
+                                                            frame,
+                                                            "int64_t");
+      session.finish();
+    }
     std::vector<Wide> got(survivors);
     cudaMemcpy(got.data(),
                reinterpret_cast<const void*>(d_out),

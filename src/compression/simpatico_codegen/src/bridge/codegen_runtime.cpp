@@ -636,8 +636,8 @@ void launch_rendered_decode(jit::FusedTree const& tree,
 {
   auto const num_chunks =
     static_cast<std::int32_t>(std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
-  auto const spec = cdj::render(
-    tree, cxx_dtype, num_chunks, va.shape, va.out_dtype != nullptr ? va.out_dtype : "");
+  auto const spec =
+    cdj::render(tree, cxx_dtype, num_chunks, va.shape, va.out_dtype != nullptr ? va.out_dtype : "");
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
   for (auto const& buffer : spec.buffers) {
@@ -864,8 +864,21 @@ void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        decode_frame& frame,
-                                        char const* out_dtype)
+                                        decode_frame& frame)
+{
+  launch_decode_fused_tree_compacted_widened(
+    tree, labeled, dtype, num_rows, mask, rows, out, frame, nullptr);
+}
+
+void launch_decode_fused_tree_compacted_widened(codegen::jit::FusedTree const& tree,
+                                                codegen::jit::LabeledBuffers const& labeled,
+                                                char const* dtype,
+                                                std::int64_t num_rows,
+                                                ::sirius::codegen::selection_mask const& mask,
+                                                row_enumeration rows,
+                                                void* out,
+                                                decode_frame& frame,
+                                                char const* out_dtype)
 {
   VariantLaunchArgs va;
   bind_enumeration(

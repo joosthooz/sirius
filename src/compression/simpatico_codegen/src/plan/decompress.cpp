@@ -535,11 +535,11 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
   auto const out_rows = masked ? static_cast<cudf::size_type>(sel->survivor_count) : num_rows;
   // A bitpack-rooted compacted decode can store each value directly in the wider type the caller
   // will restore the column to, which saves a separate widening pass over the column.
-  char const* const out_dtype = masked && root_nid < tree.nodes.size() &&
+  char const* const out_dtype    = masked && root_nid < tree.nodes.size() &&
                                     tree.nodes[root_nid].op == "bitpack" &&
                                     sel->output_type.has_value()
-                                  ? widened_element_dtype(region.root_type, *sel->output_type)
-                                  : nullptr;
+                                     ? widened_element_dtype(region.root_type, *sel->output_type)
+                                     : nullptr;
   cudf::data_type const out_type = out_dtype != nullptr ? *sel->output_type : region.root_type;
   auto output                    = cudf::make_fixed_width_column(
     out_type, out_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
@@ -559,19 +559,19 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
       throw std::runtime_error("decode row set does not match the selected column");
     }
     sirius::codegen::selection_mask const hollow{nullptr, num_rows, sel->survivor_count, nullptr};
-    launch_decode_fused_tree_compacted(*built.tree,
-                                       labeled,
-                                       dtype,
-                                       num_rows,
-                                       hollow,
-                                       row_enumeration{nullptr, sel->rows},
-                                       out,
-                                       frame,
-                                       out_dtype);
+    launch_decode_fused_tree_compacted_widened(*built.tree,
+                                               labeled,
+                                               dtype,
+                                               num_rows,
+                                               hollow,
+                                               row_enumeration{nullptr, sel->rows},
+                                               out,
+                                               frame,
+                                               out_dtype);
     return output;
   }
   bool const by_index = uses_index_walk(tree, *sel);
-  launch_decode_fused_tree_compacted(
+  launch_decode_fused_tree_compacted_widened(
     *built.tree,
     labeled,
     dtype,

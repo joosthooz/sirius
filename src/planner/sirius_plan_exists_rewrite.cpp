@@ -39,6 +39,7 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -50,6 +51,15 @@ namespace sirius::planner {
 namespace {
 
 using duckdb::LogicalOperatorType;
+
+/// Whether @p join carries a condition that is not a left/right comparison (DuckDB v2 keeps what
+/// was the separate join predicate among the conditions).
+bool has_non_comparison(duckdb::LogicalComparisonJoin const& join)
+{
+  return std::any_of(join.conditions.begin(), join.conditions.end(), [](auto const& condition) {
+    return !condition.IsComparison();
+  });
+}
 
 duckdb::unique_ptr<duckdb::Expression> ref(duckdb::LogicalType const& type, duckdb::idx_t index)
 {
@@ -98,7 +108,7 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
   bool const anti_family =
     delim.join_type == JoinType::ANTI || delim.join_type == JoinType::RIGHT_ANTI;
   if (!semi_family && !anti_family) { return std::nullopt; }
-  if (delim.predicate || delim.conditions.empty()) { return std::nullopt; }
+  if (has_non_comparison(delim) || delim.conditions.empty()) { return std::nullopt; }
 
   // The subquery side holds the DELIM_GET; the join emits the outer side's columns.
   std::size_t const sub_idx   = delim.delim_flipped ? 0 : 1;
@@ -117,7 +127,7 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
     return std::nullopt;
   }
   auto& inner = sub->Cast<duckdb::LogicalComparisonJoin>();
-  if (inner.join_type != JoinType::INNER || inner.predicate || inner.conditions.empty()) {
+  if (inner.join_type != JoinType::INNER || has_non_comparison(inner) || inner.conditions.empty()) {
     return std::nullopt;
   }
 
@@ -164,26 +174,26 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
   match.t_child     = t_child;
   std::optional<std::size_t> key_delim_col, value_delim_col;
   for (auto const& condition : inner.conditions) {
-    if (condition.left->GetExpressionClass() != ExpressionClass::BOUND_REF ||
-        condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+    if (condition.LeftReference()->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+        condition.RightReference()->GetExpressionClass() != ExpressionClass::BOUND_REF) {
       return std::nullopt;
     }
-    auto const& left  = condition.left->Cast<duckdb::BoundReferenceExpression>();
-    auto const& right = condition.right->Cast<duckdb::BoundReferenceExpression>();
+    auto const& left  = condition.LeftReference()->Cast<duckdb::BoundReferenceExpression>();
+    auto const& right = condition.RightReference()->Cast<duckdb::BoundReferenceExpression>();
     auto const& t_ref = d_child == 1 ? left : right;
     auto const& d_ref = d_child == 1 ? right : left;
-    if (condition.comparison == ExpressionType::COMPARE_EQUAL) {
+    if (condition.GetComparisonType() == ExpressionType::COMPARE_EQUAL) {
       if (key_delim_col) { return std::nullopt; }
-      key_delim_col  = d_ref.index;
-      match.t_key    = t_ref.index;
-      match.key_type = t_ref.return_type;
-      if (d_ref.return_type != t_ref.return_type) { return std::nullopt; }
-    } else if (condition.comparison == ExpressionType::COMPARE_NOTEQUAL) {
+      key_delim_col  = d_ref.Index();
+      match.t_key    = t_ref.Index();
+      match.key_type = t_ref.GetReturnType();
+      if (d_ref.GetReturnType() != t_ref.GetReturnType()) { return std::nullopt; }
+    } else if (condition.GetComparisonType() == ExpressionType::COMPARE_NOTEQUAL) {
       if (value_delim_col) { return std::nullopt; }
-      value_delim_col  = d_ref.index;
-      match.t_value    = t_ref.index;
-      match.value_type = t_ref.return_type;
-      if (d_ref.return_type != t_ref.return_type) { return std::nullopt; }
+      value_delim_col  = d_ref.Index();
+      match.t_value    = t_ref.Index();
+      match.value_type = t_ref.GetReturnType();
+      if (d_ref.GetReturnType() != t_ref.GetReturnType()) { return std::nullopt; }
     } else {
       return std::nullopt;
     }
@@ -201,7 +211,7 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
       match.key_type.id() != duckdb::LogicalTypeId::BIGINT) {
     return std::nullopt;
   }
-  auto const value_cudf = sirius::try_get_cudf_type(sirius::from_duckdb(match.value_type));
+  auto const value_cudf = sirius::get_cudf_type(sirius::from_duckdb(match.value_type));
   if (!value_cudf || !op::probe_accumulate_supports_type(*value_cudf)) { return std::nullopt; }
 
   // The delim join must equate each outer correlated column with the subquery's echo of the
@@ -210,17 +220,18 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
   if (delim.conditions.size() != delim_get.chunk_types.size()) { return std::nullopt; }
   std::vector<std::optional<std::size_t>> outer_for_delim(delim_get.chunk_types.size());
   for (auto const& condition : delim.conditions) {
-    if (condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM ||
-        condition.left->GetExpressionClass() != ExpressionClass::BOUND_REF ||
-        condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+    if (condition.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM ||
+        condition.LeftReference()->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+        condition.RightReference()->GetExpressionClass() != ExpressionClass::BOUND_REF) {
       return std::nullopt;
     }
     auto const& outer_ref =
-      (outer_idx == 0 ? condition.left : condition.right)->Cast<duckdb::BoundReferenceExpression>();
-    auto const& sub_ref =
-      (outer_idx == 0 ? condition.right : condition.left)->Cast<duckdb::BoundReferenceExpression>();
+      (outer_idx == 0 ? condition.LeftReference() : condition.RightReference())
+        ->Cast<duckdb::BoundReferenceExpression>();
+    auto const& sub_ref = (outer_idx == 0 ? condition.RightReference() : condition.LeftReference())
+                            ->Cast<duckdb::BoundReferenceExpression>();
     // Follow the subquery output column down through the projections to the inner join's output.
-    std::size_t sub_position = sub_ref.index;
+    std::size_t sub_position = sub_ref.Index();
     for (auto const* projection : projections) {
       if (sub_position >= projection->expressions.size() ||
           projection->expressions[sub_position]->GetExpressionClass() !=
@@ -228,7 +239,7 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
         return std::nullopt;
       }
       sub_position =
-        projection->expressions[sub_position]->Cast<duckdb::BoundReferenceExpression>().index;
+        projection->expressions[sub_position]->Cast<duckdb::BoundReferenceExpression>().Index();
     }
     auto const origin = resolve_inner(sub_position);
     if (!origin) { return std::nullopt; }
@@ -243,14 +254,14 @@ std::optional<exists_match> match_exists(duckdb::LogicalOperator& node)
       return std::nullopt;
     }
     if (d >= outer_for_delim.size() || outer_for_delim[d]) { return std::nullopt; }
-    outer_for_delim[d] = outer_ref.index;
+    outer_for_delim[d] = outer_ref.Index();
   }
   for (std::size_t d = 0; d < outer_for_delim.size(); ++d) {
     if (!outer_for_delim[d]) { return std::nullopt; }
     // DuckDB builds the distinct set from the duplicate-eliminated columns in this order.
     auto const& dup = delim.duplicate_eliminated_columns[d];
     if (dup->GetExpressionClass() != ExpressionClass::BOUND_REF ||
-        dup->Cast<duckdb::BoundReferenceExpression>().index != *outer_for_delim[d]) {
+        dup->Cast<duckdb::BoundReferenceExpression>().Index() != *outer_for_delim[d]) {
       return std::nullopt;
     }
   }
@@ -283,12 +294,12 @@ duckdb::unique_ptr<duckdb::Expression> some_row_differs(duckdb::LogicalType cons
 {
   return duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
     duckdb::ExpressionType::CONJUNCTION_OR,
-    duckdb::make_uniq<duckdb::BoundComparisonExpression>(duckdb::ExpressionType::COMPARE_NOTEQUAL,
-                                                         ref(value_type, min_column),
-                                                         ref(value_type, outer_value)),
-    duckdb::make_uniq<duckdb::BoundComparisonExpression>(duckdb::ExpressionType::COMPARE_NOTEQUAL,
-                                                         ref(value_type, max_column),
-                                                         ref(value_type, outer_value)));
+    duckdb::BoundComparisonExpression::Create(duckdb::ExpressionType::COMPARE_NOTEQUAL,
+                                              ref(value_type, min_column),
+                                              ref(value_type, outer_value)),
+    duckdb::BoundComparisonExpression::Create(duckdb::ExpressionType::COMPARE_NOTEQUAL,
+                                              ref(value_type, max_column),
+                                              ref(value_type, outer_value)));
 }
 
 /// Replace the matched DELIM_JOIN with
@@ -322,7 +333,9 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite(duckdb::ClientContext& conte
       output_columns.push_back(c);
     }
   } else {
-    output_columns = output_map;
+    for (auto const& projected : output_map) {
+      output_columns.push_back(projected.GetIndex());
+    }
   }
 
   // The delim scan now carries the key alone.
@@ -333,12 +346,11 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite(duckdb::ClientContext& conte
 
   // T joined to the distinct keys, keeping only the value and the key.
   auto joined = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
-  duckdb::JoinCondition key_condition;
-  key_condition.left       = ref(match.key_type, match.t_key);
-  key_condition.right      = ref(match.key_type, 0);
-  key_condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition key_condition(ref(match.key_type, match.t_key),
+                                      ref(match.key_type, 0),
+                                      duckdb::ExpressionType::COMPARE_EQUAL);
   joined->conditions.push_back(std::move(key_condition));
-  joined->left_projection_map = {match.t_value};
+  joined->left_projection_map = {duckdb::ProjectionIndex(match.t_value)};
   joined->types               = {match.value_type, match.key_type};
   joined->children.push_back(std::move(t));
   joined->children.push_back(std::move(d));
@@ -349,9 +361,9 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite(duckdb::ClientContext& conte
   aggregates.push_back(bind_extremum(context, "min", match.value_type, ref(match.value_type, 0)));
   aggregates.push_back(bind_extremum(context, "max", match.value_type, ref(match.value_type, 0)));
   auto grouped = duckdb::make_uniq<duckdb::LogicalAggregate>(
-    duckdb::idx_t{0}, duckdb::idx_t{0}, std::move(aggregates));
+    duckdb::TableIndex(0), duckdb::TableIndex(0), std::move(aggregates));
   grouped->groups.push_back(ref(match.key_type, 1));
-  grouped->grouping_sets.push_back(duckdb::GroupingSet{0});
+  grouped->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
   grouped->group_stats.resize(1);
   grouped->distinct_validity = duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES;
   grouped->types             = {match.key_type, match.value_type, match.value_type};
@@ -361,10 +373,9 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite(duckdb::ClientContext& conte
   // outer LEFT JOIN A on the key, with the key still the duplicate-eliminated column.
   auto left = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
     duckdb::JoinType::LEFT, LogicalOperatorType::LOGICAL_DELIM_JOIN);
-  duckdb::JoinCondition delim_condition;
-  delim_condition.left       = ref(match.key_type, match.outer_key);
-  delim_condition.right      = ref(match.key_type, 0);
-  delim_condition.comparison = duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+  duckdb::JoinCondition delim_condition(ref(match.key_type, match.outer_key),
+                                        ref(match.key_type, 0),
+                                        duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
   left->conditions.push_back(std::move(delim_condition));
   left->duplicate_eliminated_columns.push_back(ref(match.key_type, match.outer_key));
   left->delim_flipped = false;
@@ -385,10 +396,10 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite(duckdb::ClientContext& conte
   if (match.negated) {
     auto is_null = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
       duckdb::ExpressionType::OPERATOR_IS_NULL, duckdb::LogicalType::BOOLEAN);
-    is_null->children.push_back(predicate->Copy());
+    is_null->GetChildrenMutable().push_back(predicate->Copy());
     auto negation = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
       duckdb::ExpressionType::OPERATOR_NOT, duckdb::LogicalType::BOOLEAN);
-    negation->children.push_back(std::move(predicate));
+    negation->GetChildrenMutable().push_back(std::move(predicate));
     predicate = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
       duckdb::ExpressionType::CONJUNCTION_OR, std::move(is_null), std::move(negation));
   }
@@ -403,7 +414,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite(duckdb::ClientContext& conte
     columns.push_back(ref(outer_types[column], column));
   }
   auto projection =
-    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::idx_t{0}, std::move(columns));
+    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::TableIndex(0), std::move(columns));
   projection->types = delim.types;
   projection->children.push_back(std::move(filter));
   projection->SetEstimatedCardinality(delim.estimated_cardinality);
@@ -464,7 +475,8 @@ std::optional<peeled_scan> peel_scan(duckdb::LogicalOperator& root)
 {
   peeled_scan scan;
   duckdb::vector<duckdb::reference<duckdb::Expression>> filter_expressions;
-  duckdb::vector<duckdb::reference<duckdb::vector<duckdb::idx_t> const>> maps;  // outermost first
+  duckdb::vector<duckdb::reference<duckdb::vector<duckdb::ProjectionIndex> const>>
+    maps;  // outermost first
   auto* node = &root;
   while (node->type == LogicalOperatorType::LOGICAL_FILTER) {
     auto& filter = node->Cast<duckdb::LogicalFilter>();
@@ -483,7 +495,7 @@ std::optional<peeled_scan> peel_scan(duckdb::LogicalOperator& root)
     auto position = p;
     for (auto const& map : maps) {
       if (position >= map.get().size()) { return std::nullopt; }
-      position = map.get()[position];
+      position = map.get()[position].GetIndex();
     }
     scan.scan_position.push_back(position);
   }
@@ -495,22 +507,23 @@ std::optional<peeled_scan> peel_scan(duckdb::LogicalOperator& root)
     duckdb::ExpressionIterator::VisitExpressionClassMutable(
       copy, duckdb::ExpressionClass::BOUND_REF, [&](duckdb::unique_ptr<duckdb::Expression>& leaf) {
         auto const& reference = leaf->Cast<duckdb::BoundReferenceExpression>();
-        auto const base       = base_column(*scan.get, reference.index);
+        auto const base       = base_column(*scan.get, reference.Index());
         if (!base) {
           ok = false;
           return;
         }
-        leaf = ref(reference.return_type, *base);
+        leaf = ref(reference.GetReturnType(), *base);
       });
     if (!ok) { return std::nullopt; }
     scan.predicates.push_back(std::move(copy));
   }
 
   // Pushed-down table filters are keyed by the base column they test.
-  for (auto const& [base, table_filter] : scan.get->table_filters.filters) {
+  for (auto const& entry : scan.get->table_filters) {
+    auto const base = entry.GetIndex().GetIndex();
     if (base >= scan.get->returned_types.size()) { return std::nullopt; }
     auto column = ref(scan.get->returned_types[base], base);
-    scan.predicates.push_back(table_filter->ToExpression(*column));
+    scan.predicates.push_back(entry.Filter().ToExpression(*column));
   }
   return scan;
 }
@@ -523,8 +536,8 @@ bool same_source(duckdb::ClientContext& context,
                  duckdb::LogicalGet const& a,
                  duckdb::LogicalGet const& b)
 {
-  if (a.function.name != b.function.name || a.returned_types != b.returned_types ||
-      a.names != b.names) {
+  if (a.function.GetName().GetIdentifierName() != b.function.GetName().GetIdentifierName() ||
+      a.returned_types != b.returned_types || a.names != b.names) {
     return false;
   }
   try {
@@ -547,7 +560,7 @@ duckdb::unique_ptr<duckdb::Expression> to_positions(duckdb::Expression const& ex
   duckdb::ExpressionIterator::VisitExpressionClassMutable(
     copy, duckdb::ExpressionClass::BOUND_REF, [&](duckdb::unique_ptr<duckdb::Expression>& leaf) {
       auto const& reference = leaf->Cast<duckdb::BoundReferenceExpression>();
-      leaf                  = ref(reference.return_type, position_of_base(reference.index));
+      leaf                  = ref(reference.GetReturnType(), position_of_base(reference.Index()));
     });
   return copy;
 }
@@ -564,7 +577,7 @@ void widen(duckdb::LogicalGet& get, duckdb::idx_t base)
     }
   }
   if (slot == ids.size()) { ids.push_back(duckdb::ColumnIndex(base)); }
-  if (!get.projection_ids.empty()) { get.projection_ids.push_back(slot); }
+  if (!get.projection_ids.empty()) { get.projection_ids.push_back(duckdb::ProjectionIndex(slot)); }
   get.types.push_back(get.returned_types[base]);
 }
 
@@ -638,7 +651,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
       auto scratch = predicate->Copy();
       duckdb::ExpressionIterator::EnumerateExpression(scratch, [&](duckdb::Expression& leaf) {
         if (leaf.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          auto const base = leaf.Cast<duckdb::BoundReferenceExpression>().index;
+          auto const base = leaf.Cast<duckdb::BoundReferenceExpression>().Index();
           if (std::find(needed.begin(), needed.end(), base) == needed.end()) {
             needed.push_back(base);
           }
@@ -724,7 +737,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
   for (auto const column : missing) {
     widen(shared_get, column);
   }
-  shared_get.table_filters.filters.clear();
+  shared_get.table_filters.ClearFilters();
 
   auto delim_get         = std::move(chain[0].inner->children[1 - chain[0].t_child]);
   auto& delim_scan       = delim_get->Cast<duckdb::LogicalDelimGet>();
@@ -757,7 +770,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
       duckdb::ExpressionClass::BOUND_REF,
       [&](duckdb::unique_ptr<duckdb::Expression>& leaf) {
         auto const& reference = leaf->Cast<duckdb::BoundReferenceExpression>();
-        leaf                  = ref(reference.return_type, keep(reference.index));
+        leaf                  = ref(reference.GetReturnType(), keep(reference.Index()));
       });
     return expression;
   };
@@ -765,7 +778,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
   duckdb::vector<duckdb::LogicalType> aggregate_types{key_type};
   for (auto& sub : subs) {
-    auto const value_type                           = sub.value->return_type;
+    auto const value_type                           = sub.value->GetReturnType();
     duckdb::unique_ptr<duckdb::Expression> argument = sub.value->Copy();
     if (sub.predicate) {
       argument = duckdb::make_uniq<duckdb::BoundCaseExpression>(
@@ -781,13 +794,11 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
   }
 
   auto joined = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
-  duckdb::JoinCondition equal;
-  equal.left       = ref(key_type, key_at);
-  equal.right      = ref(key_type, 0);
-  equal.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition equal(
+    ref(key_type, key_at), ref(key_type, 0), duckdb::ExpressionType::COMPARE_EQUAL);
   joined->conditions.push_back(std::move(equal));
   for (auto const position : kept) {
-    joined->left_projection_map.push_back(position);
+    joined->left_projection_map.push_back(duckdb::ProjectionIndex(position));
     joined->types.push_back(shared_get.types[position]);
   }
   joined->types.push_back(key_type);
@@ -796,9 +807,9 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
   joined->SetEstimatedCardinality(scan_estimate);
 
   auto grouped = duckdb::make_uniq<duckdb::LogicalAggregate>(
-    duckdb::idx_t{0}, duckdb::idx_t{0}, std::move(aggregates));
+    duckdb::TableIndex(0), duckdb::TableIndex(0), std::move(aggregates));
   grouped->groups.push_back(ref(key_type, static_cast<duckdb::idx_t>(kept.size())));
-  grouped->grouping_sets.push_back(duckdb::GroupingSet{0});
+  grouped->grouping_sets.push_back(duckdb::GroupingSet{duckdb::ProjectionIndex(0)});
   grouped->group_stats.resize(1);
   grouped->distinct_validity = duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES;
   grouped->types             = aggregate_types;
@@ -807,10 +818,8 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
 
   auto left = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
     duckdb::JoinType::LEFT, LogicalOperatorType::LOGICAL_DELIM_JOIN);
-  duckdb::JoinCondition delim_condition;
-  delim_condition.left       = ref(key_type, outer_key0);
-  delim_condition.right      = ref(key_type, 0);
-  delim_condition.comparison = duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+  duckdb::JoinCondition delim_condition(
+    ref(key_type, outer_key0), ref(key_type, 0), duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
   left->conditions.push_back(std::move(delim_condition));
   left->duplicate_eliminated_columns.push_back(ref(key_type, outer_key0));
   left->delim_flipped = false;
@@ -828,14 +837,14 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
     auto const min_column = static_cast<duckdb::idx_t>(outer_width + 1 + 2 * i);
     auto const max_column = static_cast<duckdb::idx_t>(outer_width + 2 + 2 * i);
     auto condition =
-      some_row_differs(subs[i].value->return_type, min_column, max_column, subs[i].outer_value);
+      some_row_differs(subs[i].value->GetReturnType(), min_column, max_column, subs[i].outer_value);
     if (subs[i].negated) {
       auto is_null = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
         duckdb::ExpressionType::OPERATOR_IS_NULL, duckdb::LogicalType::BOOLEAN);
-      is_null->children.push_back(condition->Copy());
+      is_null->GetChildrenMutable().push_back(condition->Copy());
       auto negation = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
         duckdb::ExpressionType::OPERATOR_NOT, duckdb::LogicalType::BOOLEAN);
-      negation->children.push_back(std::move(condition));
+      negation->GetChildrenMutable().push_back(std::move(condition));
       condition = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
         duckdb::ExpressionType::CONJUNCTION_OR, std::move(is_null), std::move(negation));
     }
@@ -856,7 +865,7 @@ duckdb::unique_ptr<duckdb::LogicalOperator> rewrite_merged(duckdb::ClientContext
     columns.push_back(ref(outer_types[column], column));
   }
   auto projection =
-    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::idx_t{0}, std::move(columns));
+    duckdb::make_uniq<duckdb::LogicalProjection>(duckdb::TableIndex(0), std::move(columns));
   projection->types = types;
   projection->children.push_back(std::move(filter));
   projection->SetEstimatedCardinality(outermost.estimated_cardinality);

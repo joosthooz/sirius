@@ -28,6 +28,7 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
@@ -86,7 +87,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
   con.Query("BEGIN TRANSACTION");
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> result;
   try {
-    Parser parser(context.GetParserOptions());
+    Parser parser(context);
     parser.ParseQuery(query);
     REQUIRE(!parser.statements.empty());
 
@@ -94,13 +95,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     planner.CreatePlan(std::move(parser.statements[0]));
     REQUIRE(planner.plan);
     auto plan = std::move(planner.plan);
-    if (context.config.enable_optimizer) {
+    if (Settings::Get<EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
     plan->ResolveOperatorTypes();
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);
