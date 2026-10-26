@@ -3,6 +3,7 @@ target_sources(
   PRIVATE date_cast.cu
           dense_count_join_impl.cu
           low_cardinality_groupby.cu
+          probe_accumulate_impl.cu
           stable_hash_partition.cu
           device_copy_batch.cpp
           dynamic_filter_mask_ops.cu
