@@ -137,8 +137,11 @@ std::nullopt_t decline(std::string const& reason)
 std::optional<probe_accumulate_detection> detect_probe_accumulate(
   duckdb::LogicalAggregate const& aggregate, duckdb::SiriusContext* sirius_context)
 {
-  if (aggregate.groups.size() != 1 || aggregate.grouping_sets.size() != 1 ||
-      aggregate.grouping_sets[0].size() != 1 || !aggregate.grouping_functions.empty() ||
+  // DuckDB v2 represents an ordinary GROUP BY with no explicit grouping set.
+  bool const ordinary_grouping =
+    aggregate.grouping_sets.empty() ||
+    (aggregate.grouping_sets.size() == 1 && aggregate.grouping_sets[0].size() == 1);
+  if (aggregate.groups.size() != 1 || !ordinary_grouping || !aggregate.grouping_functions.empty() ||
       aggregate.expressions.empty() ||
       aggregate.expressions.size() > op::probe_accumulate_max_specs) {
     return std::nullopt;
@@ -295,7 +298,9 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (!sirius_ctx) { return nullptr; }
-  if (!sirius_ctx->get_config().get_operator_params().enable_probe_accumulate) { return nullptr; }
+  // Per-connection operator options, so a session SET applies.
+  auto const options = duckdb::query_operator_options(context);
+  if (!options->enable_probe_accumulate) { return nullptr; }
   // One build table, one set of accumulators, one device.
   if (sirius_ctx->get_memory_manager()
         .get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)
@@ -340,7 +345,7 @@ sirius_physical_plan_generator::try_plan_probe_accumulate(duckdb::LogicalAggrega
   // still intact; a join that cannot fit is better left on the ordinary path than failed at
   // sizing time.
   {
-    auto const& params      = sirius_ctx->get_config().get_operator_params();
+    auto const& params      = *options;
     auto const build_rows   = join.children[1]->EstimateCardinality(context);
     auto const key_bytes    = sirius::memory::saturating_mul(build_rows, std::size_t{8});
     auto const record_bytes = sirius::op::probe_accumulate_state(specs).record_bytes_for(1);
