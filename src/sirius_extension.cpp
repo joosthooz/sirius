@@ -98,6 +98,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "helper/natural_sort.hpp"
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -1125,6 +1126,16 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         host_space_by_gpu[gpu_id] = picked;
       }
     }
+    // Experimental (SIRIUS_EXP_SORTED_PIN_FILES=1): GlobFiles returns local files in directory
+    // order, and pinned chunks pack several files each, so a table stored sorted across numbered
+    // files (part.0, part.1, ...) pins into chunks whose rows are not in order. A natural sort,
+    // comparing digit runs numerically, keeps such tables sorted within and across chunks.
+    if (char const* sorted_env = std::getenv("SIRIUS_EXP_SORTED_PIN_FILES");
+        sorted_env != nullptr && std::string_view{sorted_env} == "1") {
+      std::sort(file_paths.begin(), file_paths.end(), [](auto const& lhs, auto const& rhs) {
+        return sirius::natural_less(lhs, rhs);
+      });
+    }
 
     auto& scan_mgr               = sirius_ctx->get_scan_manager();
     std::size_t const batch_size = duckdb::query_operator_options(context)->scan_task_batch_size;
@@ -1324,6 +1335,12 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // names outlive cache_info, which every insert path moves from.
     auto const pinned_column_names = cache_info.column_names();
     auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+    // With SIRIUS_EXP_PIN_UNIQUE_JOIN, every other column is observed too, as a join-key candidate.
+    auto const probe_unique_automatic =
+      sirius::late_mat::pin_unique_automatic_selection(probe_unique_columns);
+    for (std::size_t i = 0; i < probe_unique_columns.size(); ++i) {
+      if (probe_unique_automatic[i]) { probe_unique_columns[i] = true; }
+    }
 
     auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
                             std::vector<std::size_t> row_counts) {
@@ -1358,7 +1375,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                         {.expression_policy   = pin_op_params.expression_policy(),
                                          .capture_chunk_stats = capture_chunk_stats,
                                          .enable_compressed_materialization = compressed_pin,
-                                         .probe_unique_columns = probe_unique_columns});
+                                         .probe_unique_columns   = probe_unique_columns,
+                                         .probe_unique_automatic = probe_unique_automatic});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(host_result.column_storage));
@@ -1390,7 +1408,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
         {.expression_policy                 = pin_op_params.expression_policy(),
          .capture_chunk_stats               = false,
          .enable_compressed_materialization = compressed_pin,
-         .probe_unique_columns              = probe_unique_columns});
+         .probe_unique_columns              = probe_unique_columns,
+         .probe_unique_automatic            = probe_unique_automatic});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(dev_result.column_storage));
@@ -1413,7 +1432,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
                                         {.expression_policy   = pin_op_params.expression_policy(),
                                          .capture_chunk_stats = capture_chunk_stats,
                                          .enable_compressed_materialization = compressed_pin,
-                                         .probe_unique_columns = probe_unique_columns});
+                                         .probe_unique_columns   = probe_unique_columns,
+                                         .probe_unique_automatic = probe_unique_automatic});
       sirius_ctx->get_event_publisher().publish_compressed_materialization(
         sirius::event::compressed_materialization_activity::pin_columns_narrowed,
         count_narrowed_columns(mat.column_storage));
