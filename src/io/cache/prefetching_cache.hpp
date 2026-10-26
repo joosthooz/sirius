@@ -384,6 +384,10 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
+  /// Hard cap on the cache's resident chunk bytes (@c max_host_fraction
+  /// of the host tier, chunk aligned).  0 without a pool (or uncapped).
+  [[nodiscard]] std::size_t max_resident_bytes() const noexcept;
+
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
   /// Asynchronous and best-effort: this enqueues the demand and returns.  The

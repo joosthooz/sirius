@@ -333,7 +333,7 @@ prefetching_cache::prefetching_cache(
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
     _pool(std::make_shared<buffer_pool>(
-      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
+      reservation_manager, cfg.min_prefetching_budget_fraction, cfg.max_host_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
     _armed(_io_ctx->can_use_prefetching_cache()),
@@ -666,10 +666,16 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
   std::size_t n_chunks_needed = std::ranges::count_if(
     chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; });
 
+  // allocate_bulk refuses a request that would cross the pool's hard cap, like
+  // an exhausted pool.  A demand read over its chunks is then served uncached
+  // through reactor-owned staging.
   int numa_allocated = req.preferred_numa;
   auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
   if (buffers.size() != n_chunks_needed) {
-    auto const shortage = n_chunks_needed - buffers.size();
+    // Over the cap, free only what lets this request fit; otherwise the pool
+    // itself ran dry and the whole remainder is the shortfall.
+    auto const over_cap = _pool->chunks_over_cap(n_chunks_needed);
+    auto const shortage = over_cap != 0 ? over_cap : n_chunks_needed - buffers.size();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     if (!wait_for_eviction) {
       // Get reclamation moving without stalling the scan-input constructor.
@@ -1291,6 +1297,11 @@ std::size_t prefetching_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
+std::size_t prefetching_cache::max_resident_bytes() const noexcept
+{
+  return _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
+}
+
 void prefetching_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in
@@ -1542,8 +1553,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
 
     // When disposing on idle we reclaim everything; otherwise we only evict
     // under memory pressure and stop once enough chunks are free again.  Memory
-    // pressure is scored as outstanding (handed-out) chunks against the pool's
-    // aggregate reserved capacity.
+    // pressure is scored as the pool's own outstanding (handed-out) chunks
+    // against its hard cap -- not system-wide host usage, which includes spills.
     bool const should_evict =
       _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) {

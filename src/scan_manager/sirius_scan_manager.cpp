@@ -3287,11 +3287,12 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     SIRIUS_LOG_WARN(
       "[pin_table] cache.eviction is 'idle', so pinned parquet chunks are reclaimed as soon "
       "as nothing is reading them; set eviction to 'lru' for a durable pin");
-  } else if (_config.cache.eviction_threshold_fraction < 1.0) {
+  } else if (_config.cache.max_host_fraction > 0.0 && _config.cache.max_host_fraction < 1.0) {
     SIRIUS_LOG_WARN(
-      "[pin_table] cache.eviction_threshold_fraction is {}, so the evictor starts before the "
-      "pool is full and can reclaim pinned chunks; set it to 1.0 for a durable pin",
-      _config.cache.eviction_threshold_fraction);
+      "[pin_table] cache.max_host_fraction is {}, so the cache is capped below the host tier "
+      "and the evictor can reclaim pinned chunks once it fills; set it to 1.0 (or 0, uncapped) "
+      "for a durable pin",
+      _config.cache.max_host_fraction);
   }
 
   // Built locally and published only once every file is pinned: a throw part
