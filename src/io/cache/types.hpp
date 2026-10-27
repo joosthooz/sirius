@@ -149,6 +149,9 @@ class buffer_pool {
   /// (0 when they already fit).  A snapshot, used to size eviction demands.
   [[nodiscard]] size_t chunks_over_cap(size_t n) const noexcept;
 
+  /// The pool is at its configured cap (@ref max_allowed_budget_for_prefetching).
+  [[nodiscard]] bool over_static_cap() const noexcept;
+
   /// The pool has no room for another chunk under its cap (and holds more than
   /// its reserved floor).  Judged on the pool's OWN resident chunks -- not on
   /// system-wide host usage, which includes spills and would keep a cache that

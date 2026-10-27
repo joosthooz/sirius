@@ -89,6 +89,13 @@ size_t buffer_pool::chunks_over_cap(size_t n) const noexcept
   return std::min(cur, cur + n - cap_chunks);
 }
 
+bool buffer_pool::over_static_cap() const noexcept
+{
+  if (_max_allowed_budget_for_prefetching == 0) { return false; }
+  auto const resident = _n_allocated_chunks.load(std::memory_order_relaxed) * _chunk_bytes;
+  return resident + _chunk_bytes > _max_allowed_budget_for_prefetching;
+}
+
 bool buffer_pool::try_charge(size_t n) noexcept
 {
   auto cur = _n_allocated_chunks.load(std::memory_order_relaxed);

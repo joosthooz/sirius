@@ -220,6 +220,11 @@ struct eviction_request {
   /// Present when a caller may wait for this pass (including after an async
   /// prepare failure). Counted down even when nothing was reclaimable.
   std::shared_ptr<std::latch> processed;
+  /// Reclaim only chunks no live request is subscribed to: chunks the readahead
+  /// fetched for a scan that has not read them yet stay. Set when the memory is
+  /// wanted by something other than the cache's own reads, which would only
+  /// fetch those chunks again.
+  bool idle_only{false};
 };
 
 /// What the evictor's queue carries.  Two things reach it: prefetch requests,
@@ -410,6 +415,12 @@ class prefetching_cache {
   /// request has been processed. This acknowledges an eviction pass, not that
   /// the requested number of bytes could necessarily be reclaimed.
   void evict_sync(std::size_t bytes_to_free);
+
+  /// Give the host tier back up to @p bytes of chunks nobody reads or waits for,
+  /// and return how many bytes the host tier got back. Only chunks above the
+  /// pool's reservation count: those inside it stay charged to the cache.
+  /// Synchronous; for a spill that would otherwise move data to disk.
+  std::size_t release_idle(std::size_t bytes);
 
   /// Observe totals and activity since the last refresh without advancing the baseline.
   [[nodiscard]] std::string summary() const;

@@ -609,6 +609,12 @@ class sirius_scan_manager {
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
 
+  /// Give the host tier back up to @p bytes from the prefetching caches' idle
+  /// chunks (@ref sirius::io::cache::prefetching_cache::release_idle), default
+  /// cache first, and return how many bytes it got back. Safe against a running
+  /// query; serialized against @ref reset_caches.
+  std::size_t release_idle_cache_memory(std::size_t bytes);
+
   /// Retain a checkpoint key until this execution window is reset. Pinning may hold
   /// keys without registering scan providers, so their lifetime is tracked separately.
   void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
@@ -1073,6 +1079,9 @@ class sirius_scan_manager {
   std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
     std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
+  /// Serializes rebuilding the default ioctx's cache (@ref reset_caches) against
+  /// @ref release_idle_cache_memory, which reaches it from downgrade threads.
+  std::mutex _default_cache_mtx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
   /// by the immutable resolved-config snapshot, not merely by backend type, so

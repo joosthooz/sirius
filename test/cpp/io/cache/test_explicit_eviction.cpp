@@ -44,6 +44,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -500,6 +501,43 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   }
   INFO("cache: " << cache->summary());
   CHECK(tracked <= max_tracked);
+}
+
+TEST_CASE("release_idle gives back idle chunks above the reservation and keeps live ones",
+          "[cache][eviction][release_idle]")
+{
+  constexpr std::size_t mib = 1ull << 20;  // also the pool's chunk size
+  temp_data_file file(256ull << 20);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->chunk_size() == mib);
+
+  auto prepare = [&](std::int64_t offset, std::int64_t bytes) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(offset, bytes);
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    ds->fadvise(ranges, 0);
+    REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+    return ds;
+  };
+  // 64 MiB of the 256 MiB tier is the pool's reservation (constrained_lru_config).
+  auto live = prepare(0, static_cast<std::int64_t>(8 * mib));
+  auto idle = prepare(static_cast<std::int64_t>(8 * mib), static_cast<std::int64_t>(92 * mib));
+  REQUIRE(cache->claimed_bytes() == 100 * mib);
+  idle.reset();
+
+  // Only the 36 MiB above the reservation reach the host tier; the live request's chunks stay.
+  CHECK(cache->release_idle(1ull << 30) == 36 * mib);
+  CHECK(cache->claimed_bytes() == 64 * mib);
+  CHECK(cache->release_idle(1ull << 30) == 0);
+  live.reset();
 }
 
 TEST_CASE("readahead bounds memory retries and returns capacity on abandonment",
