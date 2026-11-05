@@ -256,7 +256,8 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
         split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;
-        split->row_filter_pending           = row_filter_pending;
+        split->row_filter_pending           = row_filter_pending && !next.filter_always_true;
+        split->zone_map_filter_always_true  = next.filter_always_true;
         split->origin                       = std::move(next.origin);
         split->decode_attached              = std::move(next.decode_attached);
         if (!publish(std::move(split))) break;

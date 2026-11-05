@@ -191,6 +191,19 @@ void run_pruning_assertions(duckdb::Connection& con,
   require_ok(full, "unfiltered count");
   REQUIRE(full->Collection().GetValue(0, 0).ToString() == std::to_string(kRows));
 
+  // Every chunk but the last provably passes, so only the last one evaluates the filter.
+  auto const all_but_last = con.Query("SELECT count(*), sum(v) FROM " + relation + " WHERE k < " +
+                                      std::to_string(kRows - 1) + ";");
+  require_ok(all_but_last, "filter true on all but the last chunk");
+  REQUIRE(all_but_last->Collection().GetValue(0, 0).ToString() == std::to_string(kRows - 1));
+  REQUIRE(all_but_last->Collection().GetValue(1, 0).ToString() ==
+          std::to_string((kRows - 2) * (kRows - 1)));
+  auto const all_pass = con.Query("SELECT count(*), max(k) FROM " + relation +
+                                  " WHERE k >= 0 AND k < " + std::to_string(kRows) + ";");
+  require_ok(all_pass, "filter true on every chunk");
+  REQUIRE(all_pass->Collection().GetValue(0, 0).ToString() == std::to_string(kRows));
+  REQUIRE(all_pass->Collection().GetValue(1, 0).ToString() == std::to_string(kRows - 1));
+
   // Selects-nothing: every chunk is provably empty, so the scan serves only
   // the sentinel chunk; the query must return 0 rows and must not hang.
   auto none_agg = con.Query("SELECT count(*) FROM " + relation +

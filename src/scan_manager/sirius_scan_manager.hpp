@@ -403,6 +403,9 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 struct cached_scan_plan {
   std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
   std::size_t pruned{0};
+  /// Parallel to survivor_chunk_indices: whether that chunk's zone maps prove every row passes the
+  /// scan's whole table filter. Empty when no chunk is proven.
+  std::vector<bool> filter_always_true;
 };
 
 /// Build the cached-serving databatch_provider for @p entry over
@@ -453,7 +456,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
  * @p table_filters applied. A chunk is pruned when any usable filter proves it empty against the
- * pinned entry's zone-map statistics.
+ * pinned entry's zone-map statistics, and marked filter_always_true when every filter of the set is
+ * usable and proves all of its rows pass.
  */
 [[nodiscard]] cached_scan_plan build_cached_scan_plan(
   pinned_entry const& entry,

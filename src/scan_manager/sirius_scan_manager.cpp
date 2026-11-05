@@ -309,6 +309,8 @@ struct cached_databatch_provider : public databatch_provider {
     databatch_provider::batch out{std::move(data), std::move(mask), converts, dest_bytes};
     out.origin          = origin_for(index);
     out.decode_attached = std::move(decode_attached);
+    out.filter_always_true =
+      cursor < _plan.filter_always_true.size() && _plan.filter_always_true[cursor];
     return out;
   }
 
@@ -3764,7 +3766,9 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     std::size_t entry_pos;
   };
   std::vector<usable_filter> usable;
+  std::size_t n_filters = 0;
   for (auto const& filter_entry : *table_filters) {
+    ++n_filters;
     auto const col_idx = filter_entry.GetIndex().GetIndex();
     auto const* filter = &filter_entry.Filter();
     if (col_idx >= column_ids->size()) { continue; }  // defensive
@@ -3782,20 +3786,33 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     usable.push_back({filter, pos});
   }
   if (usable.empty()) { return plan; }
+  // The scan's row filter is the conjunction of the whole set, so a chunk only skips it when every
+  // filter is checked here.
+  bool const whole_filter_usable =
+    usable.size() == n_filters && !table_filters->HasMultiColumnFilters();
 
   plan.survivor_chunk_indices.clear();
+  std::vector<bool> always_true;
+  bool any_always_true = false;
   for (std::size_t c = 0; c < n_chunks; ++c) {
     bool pruned = false;
+    bool full   = whole_filter_usable;
     for (auto const& uf : usable) {
       auto const* cell = entry.zone_maps.cell(uf.entry_pos, c);
       if (cell != nullptr && chunk_provably_empty(*uf.filter, *cell)) {
         pruned = true;
         break;
       }
+      full = full && cell != nullptr && chunk_provably_full(*uf.filter, *cell);
     }
-    if (!pruned) { plan.survivor_chunk_indices.push_back(c); }
+    if (!pruned) {
+      plan.survivor_chunk_indices.push_back(c);
+      always_true.push_back(full);
+      any_always_true = any_always_true || full;
+    }
   }
   plan.pruned = n_chunks - plan.survivor_chunk_indices.size();
+  if (any_always_true) { plan.filter_always_true = std::move(always_true); }
 
   // Sentinel chunk: an all-pruned scan must not become a zero-batch scan (zero
   // splits => zero tasks => pipeline completion never fires — the hazard both
@@ -3916,6 +3933,14 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           "chunks served)",
           pinned_name,
           total_chunks);
+      }
+      if (auto const proven = std::ranges::count(plan.filter_always_true, true); proven > 0) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager] zone maps of pinned entry '{}' prove the filter true for {}/{} "
+          "served chunks",
+          pinned_name,
+          proven,
+          plan.survivor_chunk_indices.size());
       }
 
       if (entry.mvcc) {

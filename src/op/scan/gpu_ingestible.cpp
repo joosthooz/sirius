@@ -116,8 +116,11 @@ filtered_table gpu_ingestible::materialize_table(
     // survivors, but the batch still carries the materialized column order.
     // ROW_FILTERED makes post_filter_and_project skip filter evaluation while
     // still assembling the projection/output layout.
+    bool const proven = split.zone_map_filter_always_true &&
+                        split.pushdown_predicate_columns.empty() &&
+                        !split.pushdown_filter_only_columns_dropped;
     auto const decoded_state =
-      split.pushdown_row_filtered ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
+      split.pushdown_row_filtered || proven ? filter_state::ROW_FILTERED : filter_state::UNFILTERED;
     if (split.stolen_table) {
       require_dropped_layout(*this, split, split.stolen_table->num_columns());
       // prepare_for_processing took ownership of the wrapper batch's per-query

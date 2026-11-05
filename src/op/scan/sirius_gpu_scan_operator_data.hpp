@@ -355,6 +355,10 @@ class scan_operator_input : public op::operator_data {
   /// skips filter evaluation and only projects. Never set while the gate is off — the converters
   /// then always produce the plain representation.
   bool pushdown_row_filtered{false};
+  /// True when the resident chunk's zone maps prove every row passes the scan's whole table filter.
+  /// materialize_table then returns filter_state::ROW_FILTERED unless the decode changed the
+  /// layout the filter would have read (predicate or dropped filter-only columns).
+  bool zone_map_filter_always_true{false};
   /// True when the recorded outcome is a pushdown_outcome::filter_only_columns_dropped: the decoded
   /// batch holds only the leading columns the output reads. materialize_table refuses to serve it
   /// unless it is also row-filtered and exactly as wide as the ingestible's output_prefix_width().

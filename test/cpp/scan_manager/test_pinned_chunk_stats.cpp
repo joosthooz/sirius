@@ -68,6 +68,7 @@ using duckdb::ExpressionType;
 using duckdb::LogicalType;
 using duckdb::Value;
 using sirius::scan_manager::chunk_provably_empty;
+using sirius::scan_manager::chunk_provably_full;
 using sirius::scan_manager::filter_safe_for_stats;
 using sirius::scan_manager::pinned_zone_maps;
 
@@ -312,6 +313,28 @@ TEST_CASE("pinned_chunk_stats - prune only on provable emptiness", "[pinned_chun
                          stats));
   REQUIRE(chunk_provably_empty(
     *optional_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100))), stats));
+}
+
+TEST_CASE("pinned_chunk_stats - a chunk is full only when every row provably matches",
+          "[pinned_chunk_stats]")
+{
+  auto const stats = make_stats(LogicalType::INTEGER, Value::INTEGER(10), Value::INTEGER(20));
+  auto const with_nulls =
+    make_stats(LogicalType::INTEGER, Value::INTEGER(10), Value::INTEGER(20), /*has_null=*/true);
+
+  REQUIRE(chunk_provably_full(*cmp(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::INTEGER(20)),
+                              stats));
+  REQUIRE(chunk_provably_full(*and_of(cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(0)),
+                                      cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(100))),
+                              stats));
+  // A bound inside the range, an empty chunk and a chunk with NULLs are not full.
+  REQUIRE_FALSE(
+    chunk_provably_full(*cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(20)), stats));
+  REQUIRE_FALSE(
+    chunk_provably_full(*cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(100)), stats));
+  REQUIRE_FALSE(chunk_provably_full(
+    *cmp(ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::INTEGER(20)), with_nulls));
+  REQUIRE_FALSE(chunk_provably_full(*dynamic_placeholder(), stats));
 }
 
 // ============================================================================
@@ -850,6 +873,37 @@ TEST_CASE("build_cached_scan_plan - prunes exactly the provably empty chunks",
   auto in_plan = build_cached_scan_plan(entry, &in_fs, &qcols);
   REQUIRE(in_plan.survivor_chunk_indices == survivors_t{0, 3});
   REQUIRE(in_plan.pruned == 2);
+}
+
+TEST_CASE("build_cached_scan_plan - marks the survivors whose rows all pass the filter",
+          "[pinned_chunk_stats]")
+{
+  // Column 0 (primary 3) ranges: [0,9], [1000,1009], [2000,2009], [3000,3009].
+  auto const entry = make_plan_entry(4, {3});
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+
+  auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(2005)));
+  auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+  REQUIRE(plan.survivor_chunk_indices == survivors_t{0, 1, 2});
+  REQUIRE(plan.filter_always_true == std::vector<bool>{true, true, false});
+
+  SECTION("no chunk proven leaves the marks empty")
+  {
+    auto none = make_filter_set(0, cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(1005)));
+    REQUIRE(build_cached_scan_plan(entry, &none, &qcols).filter_always_true.empty());
+  }
+
+  SECTION("a filter the zone maps cannot check proves nothing")
+  {
+    duckdb::TableFilterSet two;
+    two.SetFilterByColumnIndex(duckdb::ProjectionIndex(0),
+                               cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(2005)));
+    two.SetFilterByColumnIndex(duckdb::ProjectionIndex(1), dynamic_placeholder());
+    duckdb::vector<duckdb::ColumnIndex> two_cols{duckdb::ColumnIndex(3), duckdb::ColumnIndex(3)};
+    auto partial = build_cached_scan_plan(entry, &two, &two_cols);
+    REQUIRE(partial.survivor_chunk_indices == survivors_t{0, 1, 2});
+    REQUIRE(partial.filter_always_true.empty());
+  }
 }
 
 TEST_CASE("build_cached_scan_plan - filter keys remap through query column_ids to entry positions",

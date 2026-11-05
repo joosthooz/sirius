@@ -154,4 +154,11 @@ class pinned_zone_maps {
 [[nodiscard]] bool chunk_provably_empty(duckdb::TableFilter const& filter,
                                         duckdb::BaseStatistics const& stats) noexcept;
 
+/**
+ * @brief True iff @p filter proves that every row of a chunk with statistics @p stats matches
+ * (FILTER_ALWAYS_TRUE, which DuckDB only reports for chunks without NULLs).
+ */
+[[nodiscard]] bool chunk_provably_full(duckdb::TableFilter const& filter,
+                                       duckdb::BaseStatistics const& stats) noexcept;
+
 }  // namespace sirius::scan_manager

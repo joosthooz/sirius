@@ -65,6 +65,8 @@ struct databatch_provider {
     /// The identities of dynamic filters attached to this batch's decoder configuration.
     /// Transferred by the coalescer into the scan_operator_input.
     std::vector<op::scan::applied_entry> decode_attached;
+    /// True when the chunk's zone maps prove every row passes the scan's whole table filter.
+    bool filter_always_true{false};
   };
 
   virtual ~databatch_provider()  = default;

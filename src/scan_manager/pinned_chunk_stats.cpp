@@ -258,25 +258,41 @@ bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalTyp
   return safe(*expression_filter.expr);
 }
 
-bool chunk_provably_empty(duckdb::TableFilter const& filter,
-                          duckdb::BaseStatistics const& stats) noexcept
+namespace {
+
+duckdb::FilterPropagateResult check_chunk(duckdb::TableFilter const& filter,
+                                          duckdb::BaseStatistics const& stats) noexcept
 {
   try {
-    if (!filter_safe_for_stats(filter, stats.GetType())) { return false; }
+    if (!filter_safe_for_stats(filter, stats.GetType())) {
+      return duckdb::FilterPropagateResult::NO_PRUNING_POSSIBLE;
+    }
     // CheckStatistics needs a non-const reference to the stats object. Copy instead of const_cast
     // to keep CheckStatistics safe.
     auto local_stats = stats.Copy();
-    return filter.Cast<duckdb::ExpressionFilter>().CheckStatistics(local_stats) ==
-           duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE;
+    return filter.Cast<duckdb::ExpressionFilter>().CheckStatistics(local_stats);
   } catch (std::exception const& e) {
     // Don't propagate exceptions here on statistics checks; otherwise, a cache miss is generated
     // and the scan falls back to disk reads in sirius_scan_manager::try_assign_cached_entries().
-    SIRIUS_LOG_DEBUG("[pinned_chunk_stats] prune probe failed, keeping chunk: {}", e.what());
-    return false;
+    SIRIUS_LOG_DEBUG("[pinned_chunk_stats] zone-map probe failed, filtering chunk: {}", e.what());
   } catch (...) {
-    SIRIUS_LOG_DEBUG("[pinned_chunk_stats] prune probe failed, keeping chunk: unknown error");
-    return false;
+    SIRIUS_LOG_DEBUG("[pinned_chunk_stats] zone-map probe failed, filtering chunk: unknown error");
   }
+  return duckdb::FilterPropagateResult::NO_PRUNING_POSSIBLE;
+}
+
+}  // namespace
+
+bool chunk_provably_empty(duckdb::TableFilter const& filter,
+                          duckdb::BaseStatistics const& stats) noexcept
+{
+  return check_chunk(filter, stats) == duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE;
+}
+
+bool chunk_provably_full(duckdb::TableFilter const& filter,
+                         duckdb::BaseStatistics const& stats) noexcept
+{
+  return check_chunk(filter, stats) == duckdb::FilterPropagateResult::FILTER_ALWAYS_TRUE;
 }
 
 }  // namespace sirius::scan_manager
