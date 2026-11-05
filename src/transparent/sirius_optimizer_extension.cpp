@@ -20,6 +20,7 @@
 #include "planner/connector_registry.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "transparent/filtered_mark_joins.hpp"
 #include "transparent/parquet_footer_statistics.hpp"
 
 #include <duckdb/common/types/value.hpp>
@@ -262,7 +263,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
     }
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*captured, context));
-    conn_state->set_captured_plan(copy_logical_plan(*captured, context));
+    auto copy = copy_logical_plan(*captured, context);
+    if (auto const converted = convert_filtered_mark_joins(copy); converted > 0) {
+      SIRIUS_LOG_DEBUG("Turned {} filtered MARK joins into SEMI joins", converted);
+    }
+    conn_state->set_captured_plan(std::move(copy));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is
     // indistinguishable from "GPU ran and was slow": the query still returns correct

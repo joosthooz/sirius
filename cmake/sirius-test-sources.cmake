@@ -28,6 +28,7 @@ set(TEST_SOURCES
     test/cpp/transparent/test_plan_source_policy.cpp
     test/cpp/transparent/test_pre_optimizer_hook.cpp
     test/cpp/transparent/test_parquet_footer_statistics.cpp
+    test/cpp/transparent/test_filtered_mark_joins.cpp
     test/cpp/scan/test_scan_contracts.cpp
     test/cpp/scan/test_scan_verdicts.cpp
     test/cpp/scan/test_certification_cost.cpp
