@@ -746,20 +746,6 @@ The task-creator, downgrade, and scan-manager pools support optional CPU affinit
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
 GPU's CPU topology. `num_threads` must be `> 0` for every pool.
 
-## DuckDB Settings Changed by Sirius
-
-Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
-
-| Setting | DuckDB default | Default with Sirius | Description |
-|---------|----------------|---------------------|-------------|
-| `delim_join_as_cte` | `true` | `false` | Whether DuckDB rewrites the delim joins it creates while decorrelating subqueries into materialized CTEs |
-
-DuckDB v2 rewrites decorrelated subqueries (correlated `EXISTS`, `NOT EXISTS`, `IN` and scalar subqueries) into materialized CTEs by default. Sirius does not yet plan those shapes well: at TPC-H SF1000, Q20, Q21 and Q22 ran 1.2-3.5x slower than with explicit delim joins, because Q21's `NOT EXISTS` became an anti join that hashes every late `lineitem` row and Q20/Q22 lost their dynamic filters behind mark joins. Sirius therefore keeps the explicit `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` plans. This is a stopgap until Sirius handles the CTE plan shapes, and DuckDB already marks the setting as deprecated, so it must be revisited when DuckDB removes it. To get DuckDB's CTE plans in one session:
-
-```sql
-SET delim_join_as_cte = true;
-```
-
 ## DuckDB SET Variables
 
 Registered in `src/sirius_extension.cpp`. The `operator_params` setters, expression settings, and
@@ -835,9 +821,8 @@ old (the rule DuckDB's own file caches use), and while an S3 object's size and s
 unchanged; an object without a strong ETag is read on every query. The glob's listing supplies
 these, so checking costs no request; footers that must be read are read in parallel on DuckDB's
 worker threads. Scans with
-`union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes the
-`delim_join_as_cte = true` plan of Q21 build its `NOT EXISTS` anti join on the small side (1.34 s
-to 0.50 s).
+`union_by_name`, explicit `column_statistics` or a `schema` are left alone. At TPC-H SF1000 this makes
+Q21's plan build its `NOT EXISTS` anti join on the small side (1.34 s to 0.50 s).
 
 The footers are read when a query first scans the files, unless they were read ahead:
 `pin_table` reads the footers of the Parquet files it pins, and `sirius_analyze_parquet` reads

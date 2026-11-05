@@ -18,8 +18,8 @@
  * @file test_filtered_mark_joins.cpp
  * @brief A MARK join whose marker only feeds the FILTER above it becomes a SEMI join.
  *
- * With delim_join_as_cte DuckDB keeps such a MARK join for `x IN (subquery)` inside the CTE of a
- * correlated subquery, the shape of TPC-H q20.
+ * DuckDB keeps such a MARK join for `x IN (subquery)` inside the CTE of a correlated subquery, the
+ * shape of TPC-H q20.
  */
 
 #include "transparent/filtered_mark_joins.hpp"
@@ -68,7 +68,6 @@ struct plan_fixture {
     for (auto const* sql : tables) {
       REQUIRE_FALSE(con.Query(sql)->HasError());
     }
-    REQUIRE_FALSE(con.Query("SET delim_join_as_cte = true")->HasError());
   }
 };
 
@@ -106,7 +105,6 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     run_ok(sql);
   }
   run_ok("CHECKPOINT;");
-  run_ok("SET delim_join_as_cte = true;");
   compare_gpu_vs_cpu(q20_shape);
   compare_gpu_vs_cpu(
     "SELECT sk, qty FROM ps WHERE pk NOT IN (SELECT pn FROM p WHERE pk < 50) AND qty > "

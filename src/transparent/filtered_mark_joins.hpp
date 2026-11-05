@@ -28,10 +28,10 @@ namespace sirius::transparent {
  *
  * Such a FILTER keeps the rows whose marker is TRUE, which are exactly the rows a SEMI join keeps;
  * rows with a FALSE or NULL marker are dropped by both. DuckDB converts this shape itself, except
- * when the marker was still referenced at the time it checked: with delim_join_as_cte the marker
- * of `x IN (subquery)` is an output of the materialized CTE until the CTE filter pusher moves the
- * filter into the CTE definition, so TPC-H q20 keeps a MARK join that the GPU cannot use as a
- * dynamic-filter source.
+ * when the marker was still referenced at the time it checked: in a decorrelated subquery the
+ * marker of `x IN (subquery)` is an output of the materialized CTE until the CTE filter pusher
+ * moves the filter into the CTE definition, so TPC-H q20 keeps a MARK join that the GPU cannot use
+ * as a dynamic-filter source.
  *
  * Accepts plans with positional or binding column references. Only joins on plain equality
  * conditions whose FILTER has a projection map without the marker are converted, so no operator
