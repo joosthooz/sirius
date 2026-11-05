@@ -22,6 +22,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "planner/scan_column_origin.hpp"
+#include "transparent/parquet_footer_statistics.hpp"
 
 namespace sirius::planner {
 
@@ -62,10 +63,12 @@ duckdb_base_table_cardinality::duckdb_base_table_cardinality(
 std::optional<std::size_t> duckdb_base_table_cardinality::operator()(
   duckdb::LogicalGet const& get) const noexcept
 {
-  // Other table functions may report estimates below the true domain.
-  if (get.function.GetName() != "seq_scan" || !get.function.cardinality || !get.bind_data) {
-    return std::nullopt;
+  // Other table functions may report estimates below the true domain; a Parquet scan's footer row
+  // counts are exact.
+  if (get.function.GetName() != "seq_scan") {
+    return sirius::transparent::cached_parquet_row_count(get);
   }
+  if (!get.function.cardinality || !get.bind_data) { return std::nullopt; }
   try {
     auto const stats = get.function.cardinality(*_context, get.bind_data.get());
     if (!stats || !stats->has_max_cardinality) { return std::nullopt; }
