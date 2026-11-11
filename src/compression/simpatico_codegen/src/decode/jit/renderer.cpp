@@ -1141,10 +1141,11 @@ void Walker::emit_generic_mask_out(const ::codegen::jit::FusedTree& node)
 // =====================================================================
 // Dict mask_out -- range ballot for a Dict root, compared in the code domain.
 //
-// The keys are sorted as signed integers of the lane width, an order int64 widening keeps, so the
-// rows in [pred_lo, pred_hi] are exactly those whose code lies in [first key >= pred_lo, first key
-// > pred_hi). Every warp finds both bounds with a 32-way search over the keys (four rounds for
-// 2^20 keys), after which a row costs one code read and one unsigned compare, with no key gather.
+// The keys are sorted, so the rows in [pred_lo, pred_hi] are exactly those whose code lies in one
+// inclusive range, which the launcher finds by searching the keys once (launch_dict_code_bounds)
+// and passes as dict_bounds. A row then costs a code read and a compare, with no key gather. A
+// Bitpack codes leaf takes the packed-domain ballot itself, under the code range: the block
+// scope shadows the predicate the bitpack emitter reads.
 // =====================================================================
 void Walker::emit_dict_mask_out(const ::codegen::jit::FusedTree& node)
 {
@@ -1152,58 +1153,29 @@ void Walker::emit_dict_mask_out(const ::codegen::jit::FusedTree& node)
   if (node.children.size() != 1 || cit == node.children.end()) {
     throw RenderError("decode render: Dict must have exactly one child named 'codes'");
   }
-  const std::size_t esize = dtype_elem_size(dtype_);
-  if (esize == 0) {
-    throw RenderError("decode render: Dict op-local dtype '" + dtype_ + "' not supported");
-  }
-  const std::int32_t id     = id_of(node);
-  const std::string idstr   = std::to_string(id);
-  const std::string p_keys  = "keys_" + idstr;
-  const std::string p_count = "num_keys_" + idstr;
-  add_param("const " + dtype_ + "* __restrict__", p_keys);
-  add_buffer(id, "keys", esize);
-  add_param("int64_t", p_count);
-  buffers_.push_back(DecodeBufferSpec{id, "keys", esize, /*length_only=*/true});
-
+  const std::int32_t id    = id_of(node);
+  const std::string bounds = "dict_bounds_" + std::to_string(id);
+  add_param("const int64_t* __restrict__", bounds);
+  add_buffer(id, "dict_bounds", sizeof(std::int64_t));
   body_ << "    // --- node " << id
-        << ": Dict fused range predicate -> selection mask (code domain) ---\n";
-  const auto mark            = sm_.mark();
-  ValueSource const codes    = value_source(*cit->second, "int32_t", "len");
-  const std::string first_at = "dict_first_" + idstr;
-  const std::string lo       = "dict_clo_" + idstr;
-  const std::string span     = "dict_span_" + idstr;
-  body_ << "    const auto " << first_at << " = [&](int64_t target, bool strict) -> int64_t {\n"
-        << "        int64_t b = 0, e = " << p_count << ";\n"
-        << "        while (b < e) {\n"
-        << "            const int64_t step = (e - b + 31) / 32;\n"
-        << "            const int64_t p    = b + static_cast<int64_t>(tid & 31) * step;\n"
-        << "            bool before = false;\n"
-        << "            if (p < e) {\n"
-        << "                const int64_t k = static_cast<int64_t>(" << p_keys << "[p]);\n"
-        << "                before = strict ? k <= target : k < target;\n"
-        << "            }\n"
-        << "            const int64_t below = __popc(__ballot_sync(0xFFFFFFFFu, before));\n"
-        << "            if (below == 0) {\n"
-        << "                e = b;\n"
-        << "            } else {\n"
-        << "                const int64_t last = b + (below - 1) * step;\n"
-        << "                e = last + step < e ? last + step : e;\n"
-        << "                b = last + 1;\n"
-        << "            }\n"
-        << "        }\n"
-        << "        return b;\n"
-        << "    };\n"
-        << "    const int64_t " << lo << " = " << first_at << "(pred_lo, false);\n"
-        << "    const int64_t dict_chi_" << idstr << " = " << first_at << "(pred_hi, true);\n"
-        << "    const uint32_t " << span << " = dict_chi_" << idstr << " > " << lo
-        << " ? static_cast<uint32_t>(dict_chi_" << idstr << " - " << lo << ") : 0u;\n"
-        << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n";
-  emit_range_ballot_loop("const int64_t c = static_cast<int64_t>(" + at_pos(codes.read_expr, "i") +
-                           ");\n"
-                           "pass = static_cast<uint32_t>(c - " +
-                           lo + ") < " + span + ";\n",
-                         "    ");
-  sm_.release_to(mark);
+        << ": Dict fused range predicate -> selection mask (codes) ---\n"
+        << "    {\n"
+        << "    const int64_t pred_lo = " << bounds << "[0];\n"
+        << "    const int64_t pred_hi = " << bounds << "[1];\n";
+  const auto& codes = *cit->second;
+  if (codes.op == ::codegen::OpKind::Bitpack && codes.children.empty()) {
+    const std::string root_dtype = dtype_;
+    dtype_                       = "int32_t";
+    emit_bitpack_mask_out(codes);
+    dtype_ = root_dtype;
+  } else {
+    const auto mark      = sm_.mark();
+    ValueSource const vs = value_source(codes, "int32_t", "len");
+    body_ << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n";
+    emit_range_ballot_loop(decoded_range_pass(at_pos(vs.read_expr, "i")), "    ");
+    sm_.release_to(mark);
+  }
+  body_ << "    }\n";
 }
 
 // =====================================================================

@@ -672,8 +672,7 @@ void launch_rendered_decode(jit::FusedTree const& tree,
                                   std::to_string(found->second.length) +
                                   " entries; grid requires " + std::to_string(required));
     }
-    pointers.push_back(buffer.length_only ? static_cast<CUdeviceptr>(found->second.length)
-                                          : reinterpret_cast<CUdeviceptr>(found->second.ptr));
+    pointers.push_back(reinterpret_cast<CUdeviceptr>(found->second.ptr));
   }
 
   auto output = reinterpret_cast<CUdeviceptr>(out);
@@ -863,8 +862,29 @@ void launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
   va.pred_lo  = pred.lo;
   va.pred_hi  = pred.hi;
   va.sel_mask = dev(mask.words);
-  // The `out` slot carries the mask words: a ballot writes no column.
-  launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, mask.words, va, &mask, frame);
+  if (tree.op != codegen::OpKind::Dict) {
+    // The `out` slot carries the mask words: a ballot writes no column.
+    launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, mask.words, va, &mask, frame);
+    return;
+  }
+  // A Dict ballots its codes: the key search runs once here rather than in every block. The
+  // bounds buffer is freed in stream order behind the ballot.
+  auto const keys = labeled.find(codegen::jit::buffer_key(0, "keys"));
+  if (keys == labeled.end()) {
+    throw std::invalid_argument("simpatico decode: Dict ballot without its keys");
+  }
+  rmm::device_buffer bounds(2 * sizeof(std::int64_t), frame.stream(), frame.mr());
+  launch_dict_code_bounds(keys->second.ptr,
+                          keys->second.elem_size,
+                          static_cast<std::int64_t>(keys->second.length),
+                          pred.lo,
+                          pred.hi,
+                          static_cast<std::int64_t*>(bounds.data()),
+                          frame.stream());
+  auto with_bounds                                        = labeled;
+  with_bounds[codegen::jit::buffer_key(0, "dict_bounds")] = {
+    bounds.data(), 2, sizeof(std::int64_t)};
+  launch_decode_fused_tree_impl(tree, with_bounds, dtype, num_rows, mask.words, va, &mask, frame);
 }
 
 // Compacting value decode, either enumeration (masked_launch.hpp). The

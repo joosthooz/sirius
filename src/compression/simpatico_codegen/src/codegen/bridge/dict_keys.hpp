@@ -48,4 +48,15 @@ struct dict_keys {
                                                        ::cuda::stream_ref stream,
                                                        rmm::device_async_resource_ref mr);
 
+// Write to `out` (int64[2], device) the inclusive range of codes whose keys lie in [lo, hi]:
+// `num_keys` keys of `elem_size` bytes at `keys`, ascending as signed integers of that width. An
+// empty range comes back with out[0] > out[1]. Stream-ordered.
+void launch_dict_code_bounds(void const* keys,
+                             std::size_t elem_size,
+                             std::int64_t num_keys,
+                             std::int64_t lo,
+                             std::int64_t hi,
+                             std::int64_t* out,
+                             ::cuda::stream_ref stream);
+
 }  // namespace simpatico

@@ -251,7 +251,73 @@ std::optional<dict_keys> build(T const* data,
   return out;
 }
 
+// The first key position for which `before(key)` is false, found by one warp in rounds of 32
+// probes: every round narrows the range to one probe interval.
+template <class T, class Before>
+__device__ std::int64_t warp_partition_point(T const* keys, std::int64_t num_keys, Before before)
+{
+  std::int64_t b = 0, e = num_keys;
+  while (b < e) {
+    std::int64_t const step  = (e - b + 31) / 32;
+    std::int64_t const p     = b + static_cast<std::int64_t>(threadIdx.x) * step;
+    bool const pass          = p < e && before(static_cast<std::int64_t>(keys[p]));
+    std::int64_t const below = __popc(__ballot_sync(0xFFFFFFFFu, pass));
+    if (below == 0) {
+      e = b;
+    } else {
+      std::int64_t const last = b + (below - 1) * step;
+      e                       = last + step < e ? last + step : e;
+      b                       = last + 1;
+    }
+  }
+  return b;
+}
+
+template <class T>
+__global__ void code_bounds(T const* __restrict__ keys,
+                            std::int64_t num_keys,
+                            std::int64_t lo,
+                            std::int64_t hi,
+                            std::int64_t* __restrict__ out)
+{
+  auto const first = warp_partition_point(keys, num_keys, [lo](std::int64_t k) { return k < lo; });
+  auto const past  = warp_partition_point(keys, num_keys, [hi](std::int64_t k) { return k <= hi; });
+  if (threadIdx.x == 0) {
+    out[0] = first;
+    out[1] = past - 1;
+  }
+}
+
 }  // namespace
+
+void launch_dict_code_bounds(void const* keys,
+                             std::size_t elem_size,
+                             std::int64_t num_keys,
+                             std::int64_t lo,
+                             std::int64_t hi,
+                             std::int64_t* out,
+                             ::cuda::stream_ref stream)
+{
+  auto const s = stream.get();
+  switch (elem_size) {
+    case 1:
+      code_bounds<<<1, 32, 0, s>>>(static_cast<std::int8_t const*>(keys), num_keys, lo, hi, out);
+      break;
+    case 2:
+      code_bounds<<<1, 32, 0, s>>>(static_cast<std::int16_t const*>(keys), num_keys, lo, hi, out);
+      break;
+    case 4:
+      code_bounds<<<1, 32, 0, s>>>(static_cast<std::int32_t const*>(keys), num_keys, lo, hi, out);
+      break;
+    case 8:
+      code_bounds<<<1, 32, 0, s>>>(static_cast<std::int64_t const*>(keys), num_keys, lo, hi, out);
+      break;
+    default:
+      throw std::invalid_argument("simpatico dict keys: unsupported element size " +
+                                  std::to_string(elem_size));
+  }
+  check(cudaGetLastError(), "code bounds launch");
+}
 
 std::optional<dict_keys> build_dict_keys(void const* data,
                                          std::int64_t n,

@@ -888,19 +888,21 @@ bool run_delta_masked(const std::string& dtype, int arch)
   return true;
 }
 
-// A Dict root over bitpacked codes: the masked compacting decode takes the
-// generic seam (stage the gathered keys, masked-store them), and the ballot
-// searches the sorted keys for the range's code bounds and compares codes.
-// `keys` are sparse, so the dictionary is worth building; `wide` spreads them
-// past the bitmap range; `num_keys` past 32 makes the key search take several
-// rounds.
+// A Dict root over bitpacked (or, with `raw_codes`, raw) codes: the masked
+// compacting decode takes the generic seam (stage the gathered keys,
+// masked-store them), and the ballot compares codes against the code range of
+// the predicate, packed when the codes are a Bitpack leaf. `keys` are sparse,
+// so the dictionary is worth building; `wide` spreads them past the bitmap
+// range; `num_keys` past 32 makes the key search take several rounds.
 template <typename Element>
-bool run_dict_masked(const std::string& dtype, bool wide, int arch, std::int64_t num_keys = 40)
+bool run_dict_masked(
+  const std::string& dtype, bool wide, int arch, std::int64_t num_keys = 40, bool raw_codes = false)
 {
   const std::int64_t n  = 4 * kChunk + 333;
   const std::int64_t nc = codegen::num_chunks_for(n);
   const ::cuda::stream_ref stream{cudaStream_t{}};
-  const char* label = wide ? "search" : "bitmap";
+  const char* label =
+    raw_codes ? (wide ? "search-raw" : "bitmap-raw") : (wide ? "search" : "bitmap");
 
   std::vector<Element> keys;
   for (std::int64_t k = 0; k < num_keys; ++k)
@@ -914,10 +916,10 @@ bool run_dict_masked(const std::string& dtype, bool wide, int arch, std::int64_t
       keys[(i / kChunk == 2) ? lone : static_cast<std::size_t>(splitmix64(s) % keys.size())];
   }
 
-  auto tree =
-    jit::FusedTree::make(OpKind::Dict, {{"codes", jit::FusedTree::make(OpKind::Bitpack)}});
+  auto tree = jit::FusedTree::make(
+    OpKind::Dict, {{"codes", jit::FusedTree::make(raw_codes ? OpKind::Raw : OpKind::Bitpack)}});
   GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
-  if (!compact_packed_on_host(enc, nc, /*node_id=*/1)) return false;
+  if (!raw_codes && !compact_packed_on_host(enc, nc, /*node_id=*/1)) return false;
 
   CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
   REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree>(
@@ -1816,6 +1818,10 @@ int main()
     run_dict_masked<std::int32_t>("int32_t", /*wide=*/false, arch);
     run_dict_masked<std::int64_t>("int64_t", /*wide=*/true, arch, /*num_keys=*/2000);
     run_dict_masked<std::int16_t>("int16_t", /*wide=*/false, arch, /*num_keys=*/6);
+    run_dict_masked<std::int64_t>(
+      "int64_t", /*wide=*/true, arch, /*num_keys=*/2000, /*raw_codes=*/true);
+    run_dict_masked<std::int32_t>(
+      "int32_t", /*wide=*/false, arch, /*num_keys=*/40, /*raw_codes=*/true);
     run_dict_gather(/*key_width=*/1, arch);
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
     // The str_split gather (shallow and deep offsets chains).
