@@ -18,6 +18,11 @@ PlanEdge const* find_edge(PlanNode const& node, std::string const& channel)
   return nullptr;
 }
 
+// Whether a child op joins its parent's fused region. A Dict maps values through a dictionary
+// built over its whole input, so it only roots a region: below another op it reads that op's
+// materialized stream instead.
+bool fuses_into_parent(std::string const& op) { return op != "dict" && is_codegen_compressor(op); }
+
 // Recursively build the FusedTree for the fusable region rooted at `nid`,
 // appending each created node to `out.preorder` in DFS-preorder (parent before
 // children; children visited in ascending child-key order so the index matches
@@ -40,7 +45,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
     // Child keyed "zigzag" everywhere — the DSL port, the fused rep channel,
     // and the renderer all agree, so there is no name translation.
     std::shared_ptr<jit::FusedTree> zz_child;
-    if (zz != nullptr && is_codegen_compressor(tree.nodes[zz->child].op)) {
+    if (zz != nullptr && fuses_into_parent(tree.nodes[zz->child].op)) {
       zz_child = build_rec(tree, zz->child, out);
       if (!zz_child) return nullptr;
     } else {
@@ -56,7 +61,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
     auto t               = jit::FusedTree::make(OpKind::Delta);
     out.preorder.push_back({t.get(), nid, false, 0});
     std::shared_ptr<jit::FusedTree> diff_child;
-    if (diff != nullptr && is_codegen_compressor(tree.nodes[diff->child].op)) {
+    if (diff != nullptr && fuses_into_parent(tree.nodes[diff->child].op)) {
       diff_child = build_rec(tree, diff->child, out);
       if (!diff_child) return nullptr;
     } else {
@@ -77,7 +82,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
     // runs — dual-mode: fuse a codegen child, or synthesize Raw passthrough.
     // Like values, a missing edge (terminal run-count storage) is valid.
     std::shared_ptr<jit::FusedTree> runs_child;
-    if (runs != nullptr && is_codegen_compressor(tree.nodes[runs->child].op)) {
+    if (runs != nullptr && fuses_into_parent(tree.nodes[runs->child].op)) {
       runs_child = build_rec(tree, runs->child, out);
       if (!runs_child) return nullptr;
     } else {
@@ -90,7 +95,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
 
     // values — dual-mode: fuse a codegen child, or synthesize Raw passthrough.
     std::shared_ptr<jit::FusedTree> values_child;
-    if (values != nullptr && is_codegen_compressor(tree.nodes[values->child].op)) {
+    if (values != nullptr && fuses_into_parent(tree.nodes[values->child].op)) {
       values_child = build_rec(tree, values->child, out);
       if (!values_child) return nullptr;
     } else {
@@ -109,7 +114,7 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
     auto t                 = jit::FusedTree::make(OpKind::For);
     out.preorder.push_back({t.get(), nid, false, 0});
     std::shared_ptr<jit::FusedTree> deltas_child;
-    if (deltas != nullptr && is_codegen_compressor(tree.nodes[deltas->child].op)) {
+    if (deltas != nullptr && fuses_into_parent(tree.nodes[deltas->child].op)) {
       deltas_child = build_rec(tree, deltas->child, out);
       if (!deltas_child) return nullptr;
     } else {
@@ -119,6 +124,24 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
       out.preorder.push_back({deltas_child.get(), 0, true, nid, "for", "deltas"});
     }
     t->children.emplace("deltas", std::move(deltas_child));
+    return t;
+  }
+
+  if (node.op == "dict") {
+    // Dual-mode, as `for`: fuse a codegen codes child, or synthesize a Raw passthrough that
+    // materialises the int32 codes. `keys` is a stored (or tail-routed) channel, not a lane.
+    PlanEdge const* codes = find_edge(node, "codes");
+    auto t                = jit::FusedTree::make(OpKind::Dict);
+    out.preorder.push_back({t.get(), nid, false, 0});
+    std::shared_ptr<jit::FusedTree> codes_child;
+    if (codes != nullptr && fuses_into_parent(tree.nodes[codes->child].op)) {
+      codes_child = build_rec(tree, codes->child, out);
+      if (!codes_child) return nullptr;
+    } else {
+      codes_child = jit::FusedTree::make(OpKind::Raw);
+      out.preorder.push_back({codes_child.get(), 0, true, nid, "dict", "codes"});
+    }
+    t->children.emplace("codes", std::move(codes_child));
     return t;
   }
 

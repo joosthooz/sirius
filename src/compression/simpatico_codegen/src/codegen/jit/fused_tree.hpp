@@ -27,7 +27,7 @@
 
 namespace codegen {
 
-enum class OpKind : int { Bitpack, For, Delta, Rle, Raw, Zigzag, None };
+enum class OpKind : int { Bitpack, For, Delta, Rle, Raw, Zigzag, Dict, None };
 
 inline constexpr int kChunkSize = 1024;
 inline constexpr int kTBSize    = 128;
@@ -90,6 +90,7 @@ inline std::string op_kind_name(OpKind op)
     case OpKind::Rle: return "RLE";
     case OpKind::Raw: return "RAW";
     case OpKind::Zigzag: return "ZIGZAG";
+    case OpKind::Dict: return "DICT";
     case OpKind::None: return "NONE";
   }
   return "UNKNOWN";

@@ -76,6 +76,7 @@ add_library(
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/bridge/dict_keys.cu
   src/selection/selection_wave.cu
   src/selection/chunk_row_set_build.cu
   src/selection/row_id_space.cu
@@ -193,6 +194,7 @@ function(add_codegen_host_test name)
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
+add_codegen_host_test(test_dict)
 add_codegen_host_test(test_async_decode)
 target_link_options(test_async_decode PRIVATE "-Wl,--wrap=cudaStreamQuery"
                     "-Wl,--wrap=cudaStreamSynchronize")
@@ -233,6 +235,7 @@ enable_testing()
 add_subdirectory(tests/cache)
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
+add_test(NAME dict COMMAND test_dict)
 add_test(NAME async_decode COMMAND test_async_decode)
 add_test(NAME scan_filter_session COMMAND test_scan_filter_session)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)

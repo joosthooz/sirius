@@ -275,6 +275,7 @@ std::unique_ptr<compressed_representation> reconstruct(std::string const& compre
     case OpId::Delta:
     case OpId::Rle:
     case OpId::For:
+    case OpId::Dict:
     case OpId::Zigzag: break;
   }
   reject("unsupported compressor '" + compressor_name + "' for reconstruction");

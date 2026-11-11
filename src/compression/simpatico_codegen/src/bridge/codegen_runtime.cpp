@@ -61,6 +61,7 @@
 // construction, plan-DSL walk, rmm device buffers).  Keeping these
 // includes here avoids re-parsing them for the decode-only TUs that
 // already compile fine without them.
+#include "codegen/bridge/dict_keys.hpp"
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
@@ -1085,6 +1086,49 @@ std::size_t find_buffer_idx(const std::vector<cje::EncodeBufferSpec>& bufs,
   std::abort();
 }
 
+// The most keys a Dict may build: past half the rows, a dictionary costs more than it saves.
+std::int64_t dict_max_keys(std::int64_t num_rows)
+{
+  constexpr std::int64_t kDictMaxKeys = std::int64_t{1} << 20;
+  return std::min(kDictMaxKeys, std::max<std::int64_t>(1, num_rows / 2));
+}
+
+// A Dict region's prebuilt dictionary, bound as its kernel's input buffers.
+CUdeviceptr dict_input(simpatico::dict_keys const* dict, cje::EncodeBufferSpec const& buffer)
+{
+  if (dict == nullptr) {
+    throw std::invalid_argument("simpatico encode: input buffer '" + buffer.field +
+                                "' without a dictionary");
+  }
+  void const* p = buffer.field == "dict_meta"     ? dict->meta.data()
+                  : buffer.field == "dict_bitmap" ? dict->bitmap.data()
+                  : buffer.field == "dict_rank"   ? dict->rank.data()
+                  : buffer.field == "keys"        ? dict->keys.data()
+                                                  : nullptr;
+  if (p == nullptr && buffer.field != "keys") {
+    throw std::invalid_argument("simpatico encode: unknown input buffer '" + buffer.field + "'");
+  }
+  return reinterpret_cast<CUdeviceptr>(p);
+}
+
+// The dictionary a Dict publishes as its `keys` channel.
+std::unique_ptr<simpatico::codegen_fused_representation> dict_rep(simpatico::dict_keys& dict,
+                                                                  cudf::data_type original_type,
+                                                                  std::int64_t num_rows,
+                                                                  ::cuda::stream_ref stream)
+{
+  auto rep = std::make_unique<simpatico::codegen_fused_representation>(
+    simpatico::OpId::Dict, original_type, static_cast<cudf::size_type>(num_rows));
+  rep->buffers.emplace_back(
+    "keys",
+    std::make_unique<cudf::column>(original_type,
+                                   static_cast<cudf::size_type>(dict.num_keys),
+                                   std::move(dict.keys),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+                                   0));
+  return rep;
+}
+
 // A fused region worth encoding in measure and pack modes: one whose full-mode encode
 // compacts afterwards, i.e. that has a Bitpack or an Rle. Every output besides the
 // variable-length `packed`, `lw_shards` and Raw `data` is one element per chunk, or one
@@ -1101,6 +1145,7 @@ bool measurable(const simpatico::CodegenHead& head,
       case cc::OpKind::Delta:
       case cc::OpKind::For:
       case cc::OpKind::Zigzag:
+      case cc::OpKind::Dict:
       case cc::OpKind::Raw: break;
       default: return false;
     }
@@ -1108,7 +1153,9 @@ bool measurable(const simpatico::CodegenHead& head,
   if (!compacts) return false;
   auto const nc = static_cast<std::size_t>(num_chunks);
   for (auto const& buffer : spec.buffers) {
-    if (buffer.field == "packed" || buffer.field == "lw_shards" || buffer.field == "data") continue;
+    if (buffer.input || buffer.field == "packed" || buffer.field == "lw_shards" ||
+        buffer.field == "data")
+      continue;
     bool const offsets = buffer.field == "rle_runs_offsets" || buffer.field == "offsets";
     if (buffer.length != (offsets ? nc + 1 : nc)) return false;
   }
@@ -1131,6 +1178,7 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
                                std::int64_t num_rows,
                                std::int32_t num_chunks,
                                std::uintptr_t data_ptr,
+                               simpatico::dict_keys* dict,
                                simpatico::fused_leaf_builder* builder,
                                ::cuda::stream_ref stream,
                                rmm::device_async_resource_ref mr)
@@ -1140,7 +1188,7 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
   std::vector<rmm::device_buffer> bufs;
   bufs.reserve(measure.buffers.size());
   for (auto const& buffer : measure.buffers) {
-    if (buffer.field == "packed" || buffer.field == "data") {
+    if (buffer.input || buffer.field == "packed" || buffer.field == "data") {
       bufs.emplace_back();
       continue;
     }
@@ -1179,7 +1227,8 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
   // Measure: per-chunk outputs and each Bitpack's live-word count; nothing is packed.
   std::vector<CUdeviceptr> measure_ptrs(measure.buffers.size(), 0);
   for (std::size_t i = 0; i < measure.buffers.size(); ++i)
-    measure_ptrs[i] = reinterpret_cast<CUdeviceptr>(bufs[i].data());
+    measure_ptrs[i] = measure.buffers[i].input ? dict_input(dict, measure.buffers[i])
+                                               : reinterpret_cast<CUdeviceptr>(bufs[i].data());
   launch(measure, measure_fn, measure_ptrs, "cpp encode: measure cuLaunchKernel");
 
   // Per Bitpack node: its exact output, sized from its live-word count.
@@ -1289,7 +1338,9 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
   std::vector<CUdeviceptr> pack_ptrs(pack.buffers.size(), 0);
   for (std::size_t i = 0; i < pack.buffers.size(); ++i) {
     auto const& buffer = pack.buffers[i];
-    if (buffer.field == "packed") {
+    if (buffer.input) {
+      pack_ptrs[i] = dict_input(dict, buffer);
+    } else if (buffer.field == "packed") {
       pack_ptrs[i] = reinterpret_cast<CUdeviceptr>(outputs.at(buffer.node_id).dense.data());
     } else if (buffer.field == "bp_offsets") {
       pack_ptrs[i] = reinterpret_cast<CUdeviceptr>(outputs.at(buffer.node_id).offsets.data());
@@ -1401,6 +1452,9 @@ int launch_encode_measure_pack(const simpatico::CodegenHead& head,
           {origin.parent_node, origin.parent_channel, std::move(rep)});
         break;
       }
+      case cc::OpKind::Dict:
+        builder->leaves.emplace(origin.plan_node, dict_rep(*dict, original_type, num_rows, stream));
+        break;
       default: break;  // Zigzag: rewrites lanes inline, owns no buffers
     }
   }
@@ -1428,6 +1482,26 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
   try {
     const std::int32_t num_chunks = static_cast<std::int32_t>(
       std::max<std::int64_t>(1, (num_rows + kChunkSize - 1) / kChunkSize));
+
+    // A Dict root maps values through a dictionary of the whole column, so it is built first.
+    std::optional<simpatico::dict_keys> dict;
+    if (head.tree->op == cc::OpKind::Dict) {
+      auto const width = static_cast<std::size_t>(cudf::size_of(original_type));
+      if (width > sizeof(std::int64_t)) {
+        std::fprintf(stderr, "simpatico::codegen: cpp encode: dict supports up to 8-byte values\n");
+        return 0;
+      }
+      dict = simpatico::build_dict_keys(reinterpret_cast<void const*>(data_ptr),
+                                        num_rows,
+                                        width,
+                                        dict_max_keys(num_rows),
+                                        stream,
+                                        mr);
+      if (!dict) {
+        std::fprintf(stderr, "simpatico::codegen: cpp encode: dict declined, too many keys\n");
+        return 0;
+      }
+    }
 
     // Render the kernel + buffer manifest.
     cje::EncodeKernelSpec spec;
@@ -1457,6 +1531,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                         num_rows,
                                         num_chunks,
                                         data_ptr,
+                                        dict ? &*dict : nullptr,
                                         builder,
                                         stream,
                                         mr);
@@ -1482,6 +1557,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     bufs.reserve(spec.buffers.size());
     std::vector<CUdeviceptr> dev_ptrs(spec.buffers.size(), 0);
     for (std::size_t i = 0; i < spec.buffers.size(); ++i) {
+      if (spec.buffers[i].input) {
+        bufs.emplace_back();
+        dev_ptrs[i] = dict_input(dict ? &*dict : nullptr, spec.buffers[i]);
+        continue;
+      }
       const std::size_t bytes = spec.buffers[i].length * spec.buffers[i].elem_size;
       bufs.emplace_back(bytes, stream, mr);
       dev_ptrs[i] = reinterpret_cast<CUdeviceptr>(bufs.back().data());
@@ -1777,6 +1857,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // (a fused op or a Raw passthrough) owns the buffers.
           break;
 
+        case cc::OpKind::Dict:
+          builder->leaves.emplace(origin.plan_node,
+                                  dict_rep(*dict, original_type, num_rows, stream));
+          break;
+
         case cc::OpKind::Raw: {
           // Synthesized Raw passthrough leaf (is_raw_passthrough == true).
           // No PlanTree op node of its own.  The rep is keyed by
@@ -1819,12 +1904,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
 
           if (is_fixed_stride) {
             // ─── Fixed-stride Raw (FOR deltas / Delta differences / ZigZag codes) ───
-            // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
+            // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK. Only the last chunk
+            // is partial, so the first num_rows slots are the stream; the tail is unwritten.
             const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
 
             auto data_col = std::make_unique<cudf::column>(
               data_elem_type,
-              static_cast<cudf::size_type>(num_chunks * kChunkSize),
+              static_cast<cudf::size_type>(num_rows),
               std::move(bufs[i_data]),
               cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
               0);

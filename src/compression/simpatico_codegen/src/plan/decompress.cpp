@@ -93,6 +93,7 @@ std::string codegen_kind_for_compressor(std::string const& c)
   if (c == "rle") return "rle";
   if (c == "for") return "for";
   if (c == "zigzag") return "zigzag";
+  if (c == "dict") return "dict";
   return {};
 }
 
@@ -109,6 +110,7 @@ std::vector<std::string> consumed_slots(std::string const& kind)
   if (kind == "rle") return {"rle_runs_offsets"};
   if (kind == "for") return {"references"};
   if (kind == "zigzag") return {"zigzag"};
+  if (kind == "dict") return {"keys"};
   if (kind == "RawFused") return {"data", "offsets"};
   return {};
 }
@@ -383,7 +385,8 @@ void bind_real_node_buffers(std::int32_t node_id,
 }
 
 // Each fused node's lane width, as both renderers type it: Rle's `runs` are int32 run
-// counts, and every other child inherits its parent's width (the root's is the column's).
+// counts, Dict's `codes` are int32 key indices, and every other child inherits its parent's
+// width (the root's is the column's).
 std::unordered_map<codegen::jit::FusedTree const*, std::size_t> lane_elem_sizes(
   codegen::jit::FusedTree const& root, std::size_t element_size)
 {
@@ -392,8 +395,9 @@ std::unordered_map<codegen::jit::FusedTree const*, std::size_t> lane_elem_sizes(
     [&](auto const& self, codegen::jit::FusedTree const& node, std::size_t width) -> void {
     sizes.emplace(&node, width);
     for (auto const& [name, child] : node.children) {
-      bool const runs = node.op == codegen::OpKind::Rle && name == "runs";
-      self(self, *child, runs ? sizeof(std::int32_t) : width);
+      bool const int32_lane = (node.op == codegen::OpKind::Rle && name == "runs") ||
+                              (node.op == codegen::OpKind::Dict && name == "codes");
+      self(self, *child, int32_lane ? sizeof(std::int32_t) : width);
     }
   };
   visit(visit, root, element_size);

@@ -393,6 +393,15 @@ class Walker {
                             const std::string& dst,
                             const std::string& len,
                             const std::string& elem_type);
+  void emit_dict_producer(const ::codegen::jit::FusedTree& node,
+                          const std::string& dst,
+                          const std::string& len,
+                          const std::string& elem_type);
+
+  // Gather from the Dict's keys by its int32 codes child's read expr.
+  ValueSource dict_value_source(const ::codegen::jit::FusedTree& node,
+                                const std::string& elem_type,
+                                const std::string& len);
 
   // Emit ZigZag scalar-load prelude + return its closed-form (inverse) read
   // expr — reads the stored `zigzag` channel and applies the inverse map
@@ -623,6 +632,7 @@ void Walker::emit_producer(const ::codegen::jit::FusedTree& node,
     case ::codegen::OpKind::For: emit_for_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Raw: emit_raw_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Zigzag: emit_zigzag_producer(node, dst, len, elem_type); return;
+    case ::codegen::OpKind::Dict: emit_dict_producer(node, dst, len, elem_type); return;
     default:
       throw RenderError(std::string("decode render: invalid op '") +
                         ::codegen::jit::op_kind_name(node.op) + "'");
@@ -1712,6 +1722,53 @@ void Walker::emit_zigzag_producer(const ::codegen::jit::FusedTree& node,
 }
 
 // =====================================================================
+// Dict — a gather from the keys by the int32 codes child.
+//
+// The codes child is any int32 producer: a closed-form Bitpack or Raw leaf splices straight in,
+// a staged one (Delta/Rle) lands in a slab that stays live for the caller, as value_source's own.
+// The keys are read from global memory; a small dictionary stays resident in L1/L2.
+// =====================================================================
+ValueSource Walker::dict_value_source(const ::codegen::jit::FusedTree& node,
+                                      const std::string& elem_type,
+                                      const std::string& len)
+{
+  auto const cit = node.children.find("codes");
+  if (node.children.size() != 1 || cit == node.children.end()) {
+    throw RenderError("decode render: Dict must have exactly one child named 'codes'");
+  }
+  const std::size_t esize = dtype_elem_size(elem_type);
+  if (esize == 0) {
+    throw RenderError("decode render: Dict op-local dtype '" + elem_type + "' not supported");
+  }
+  const std::int32_t id    = id_of(node);
+  const std::string p_keys = "keys_" + std::to_string(id);
+  add_param("const " + elem_type + "* __restrict__", p_keys);
+  add_buffer(id, "keys", esize);
+
+  ValueSource const codes = value_source(*cit->second, "int32_t", len);
+  ValueSource vs;
+  vs.elem_type = elem_type;
+  vs.read_expr = p_keys + "[" + codes.read_expr + "]";
+  return vs;
+}
+
+void Walker::emit_dict_producer(const ::codegen::jit::FusedTree& node,
+                                const std::string& dst,
+                                const std::string& len,
+                                const std::string& elem_type)
+{
+  const auto mark      = sm_.mark();
+  ValueSource const vs = dict_value_source(node, elem_type, len);
+  body_ << "    // --- node " << id_of(node) << ": Dict producer (" << elem_type << ") ---\n"
+        << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+        << ") {\n"
+        << "        (" << dst << ")[i] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "    }\n"
+        << "    __syncthreads();\n";
+  sm_.release_to(mark);
+}
+
+// =====================================================================
 // value_source — closed-form expr (Bitpack / Raw / Zigzag over Raw) or
 // materialised-slab read (Delta / Rle / non-leaf).
 // =====================================================================
@@ -1726,6 +1783,7 @@ ValueSource Walker::value_source(const ::codegen::jit::FusedTree& node,
   if (node.op == ::codegen::OpKind::Raw && node.children.empty()) {
     return raw_value_source_inline(node, elem_type);
   }
+  if (node.op == ::codegen::OpKind::Dict) { return dict_value_source(node, elem_type, len); }
   if (node.op == ::codegen::OpKind::Zigzag && node.children.size() == 1) {
     auto const& child = *node.children.begin()->second;
     if (child.op == ::codegen::OpKind::Raw && child.children.empty()) {

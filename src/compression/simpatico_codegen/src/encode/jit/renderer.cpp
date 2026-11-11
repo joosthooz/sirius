@@ -270,7 +270,8 @@ class Walker {
                   const std::string& field,
                   std::size_t elem_size,
                   std::size_t length,
-                  bool no_pre_zero = false)
+                  bool no_pre_zero = false,
+                  bool input       = false)
   {
     EncodeBufferSpec b;
     b.node_id     = node_id;
@@ -278,6 +279,7 @@ class Walker {
     b.elem_size   = elem_size;
     b.length      = length;
     b.no_pre_zero = no_pre_zero;
+    b.input       = input;
     buffers_.push_back(std::move(b));
   }
 
@@ -340,6 +342,7 @@ class Walker {
   void emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in);
   void emit_raw(const ::codegen::jit::FusedTree& node, LaneInput in);
   void emit_zigzag(const ::codegen::jit::FusedTree& node, LaneInput in);
+  void emit_dict(const ::codegen::jit::FusedTree& node, LaneInput in);
 
   // ----------------- Source prelude (constant per kernel) -----------------
   static constexpr const char* kPrelude = R"src(
@@ -398,6 +401,7 @@ void Walker::emit_node(const ::codegen::jit::FusedTree& node, LaneInput in)
     case ::codegen::OpKind::Raw: emit_raw(node, std::move(in)); return;
     case ::codegen::OpKind::For: emit_for(node, std::move(in)); return;
     case ::codegen::OpKind::Zigzag: emit_zigzag(node, std::move(in)); return;
+    case ::codegen::OpKind::Dict: emit_dict(node, std::move(in)); return;
     case ::codegen::OpKind::None:
     default:
       throw RenderError(std::string("render: invalid op kind '") +
@@ -587,6 +591,97 @@ void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
   out.length_expr = in.length_expr;
 
   emit_node(*dit->second, std::move(out));
+}
+
+// =====================================================================
+// emit_dict — value-to-code transformer over a prebuilt sorted dictionary.
+//
+// The keys are built before the launch from the whole column (see build_dict_keys in the
+// bridge), so Dict must be the root of its fused region: its lane is the column itself. The
+// kernel only maps each value to its index among the sorted keys, staged once per chunk into a
+// shared int32 slab so a child that reads its lane twice (Bitpack) looks each value up once.
+//
+// Inputs, bound by the launcher rather than allocated:
+//   dict_meta   int64[4]  {key minimum, key count, lookup mode, bitmap words}
+//   dict_bitmap uint32[]  mode 0: bit (v - min) set for every key
+//   dict_rank   int32[]   mode 0: keys below each bitmap word (exclusive prefix popcount)
+//   keys        T[K]      the sorted keys; mode 1 binary-searches them
+// Mode 0 is chosen when the key range is small enough for a bitmap, which makes a code two
+// L2-resident loads and a popcount; mode 1 costs log2(K) loads.
+// =====================================================================
+void Walker::emit_dict(const ::codegen::jit::FusedTree& node, LaneInput in)
+{
+  auto cit = node.children.find("codes");
+  if (node.children.size() != 1 || cit == node.children.end()) {
+    throw RenderError("render: Dict must have exactly one child named 'codes'");
+  }
+  const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
+  if (op_dt == nullptr || op_dt->elem_size > 8) {
+    throw RenderError("render: Dict op-local dtype '" + in.elem_type + "' not supported");
+  }
+  const std::int32_t id = take_id();
+  if (id != 0 || in.kind != LaneInput::Global) {
+    throw RenderError("render: Dict must be the root of its fused region");
+  }
+  const std::string idstr  = std::to_string(id);
+  const std::string utype  = unsigned_counterpart(op_dt->elem_size);
+  const std::string p_meta = "dict_meta_" + idstr;
+  const std::string p_bmp  = "dict_bitmap_" + idstr;
+  const std::string p_rank = "dict_rank_" + idstr;
+  const std::string p_keys = "dict_keys_" + idstr;
+  add_param("const int64_t* __restrict__", p_meta);
+  add_param("const uint32_t* __restrict__", p_bmp);
+  add_param("const int32_t* __restrict__", p_rank);
+  add_param("const " + in.elem_type + "* __restrict__", p_keys);
+  add_buffer(id, "dict_meta", sizeof(std::int64_t), 0, false, /*input=*/true);
+  add_buffer(id, "dict_bitmap", sizeof(std::uint32_t), 0, false, /*input=*/true);
+  add_buffer(id, "dict_rank", sizeof(std::int32_t), 0, false, /*input=*/true);
+  add_buffer(id, "keys", op_dt->elem_size, 0, false, /*input=*/true);
+
+  const auto mark          = sm_.mark();
+  const std::string codes  = "dict_codes_" + idstr;
+  const std::size_t off    = sm_.alloc(sizeof(std::int32_t), ::codegen::kChunkSize);
+  const std::string v_min  = "dict_min_" + idstr;
+  const std::string v_k    = "dict_k_" + idstr;
+  const std::string v_mode = "dict_mode_" + idstr;
+  body_ << "    // --- node " << id << ": Dict (" << in.elem_type << " -> int32 codes) ---\n"
+        << "    int32_t* " << codes << " = reinterpret_cast<int32_t*>(workspace + " << off << ");\n"
+        << "    {\n"
+        << "        const " << in.elem_type << " " << v_min << " = static_cast<" << in.elem_type
+        << ">(" << p_meta << "[0]);\n"
+        << "        const int32_t " << v_k << " = static_cast<int32_t>(" << p_meta << "[1]);\n"
+        << "        const int32_t " << v_mode << " = static_cast<int32_t>(" << p_meta << "[2]);\n"
+        << "        const int32_t _dlen = static_cast<int32_t>(" << in.length_expr << ");\n"
+        << "        for (int32_t i = tid; i < _dlen; i += 128) {\n"
+        << "            const " << in.elem_type << " _dv = (" << at_lane(in.read_expr, "i")
+        << ");\n"
+        << "            int32_t _dc;\n"
+        << "            if (" << v_mode << " == 0) {\n"
+        << "                const uint32_t _do = static_cast<uint32_t>(static_cast<" << utype
+        << ">(_dv) - static_cast<" << utype << ">(" << v_min << "));\n"
+        << "                _dc = " << p_rank << "[_do >> 5] + __popc(" << p_bmp
+        << "[_do >> 5] & ((1u << (_do & 31u)) - 1u));\n"
+        << "            } else {\n"
+        << "                int32_t _lo = 0, _hi = " << v_k << ";\n"
+        << "                while (_lo < _hi) {\n"
+        << "                    const int32_t _mid = (_lo + _hi) >> 1;\n"
+        << "                    if (" << p_keys
+        << "[_mid] < _dv) _lo = _mid + 1; else _hi = _mid;\n"
+        << "                }\n"
+        << "                _dc = _lo;\n"
+        << "            }\n"
+        << "            " << codes << "[i] = _dc;\n"
+        << "        }\n"
+        << "    }\n"
+        << "    __syncthreads();\n";
+
+  LaneInput out;
+  out.kind        = LaneInput::Shared;
+  out.elem_type   = "int32_t";
+  out.read_expr   = codes + "[__LANE__]";
+  out.length_expr = in.length_expr;
+  emit_node(*cit->second, std::move(out));
+  sm_.release_to(mark);
 }
 
 // =====================================================================

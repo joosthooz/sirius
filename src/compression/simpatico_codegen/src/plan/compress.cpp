@@ -678,6 +678,7 @@ fused_op_channels canonical_fused_channels(std::string const& op)
   if (op == "rle") return {{"runs", "values"}, {}};
   if (op == "for") return {{"deltas"}, {"references"}};
   if (op == "zigzag") return {{"zigzag"}, {}};
+  if (op == "dict") return {{"codes"}, {"keys"}};
   return {};  // bitpack: rep->named_channels() are already canonical
 }
 

@@ -40,8 +40,8 @@
 // Supported ops
 // -------------
 // Bitpack (leaf); Raw (verbatim-passthrough leaf, synthesized for a
-// delta/rle/for/zigzag channel that isn't further fused); Delta, Rle, For, and
-// Zigzag, composed arbitrarily — the staged-materialisation walker handles
+// delta/rle/for/zigzag/dict channel that isn't further fused); Dict (region root only);
+// Delta, Rle, For, and Zigzag, composed arbitrarily — the staged-materialisation walker handles
 // nested Rle/Delta/For/Zigzag and Raw children.  An op the renderer can't
 // emit throws a `RenderError` with a clear diagnostic.
 //
@@ -83,6 +83,9 @@ struct EncodeBufferSpec {
   std::size_t elem_size;    // sizeof one element of the buffer's logical dtype
   std::size_t length;       // number of elements
   bool no_pre_zero{false};  // skip cudaMemsetAsync pre-zero (smem path handles it)
+  // Bound by the launcher to a buffer it already holds (Dict's prebuilt keys) instead of
+  // allocated; `length` is then 0 and the kernel only reads it.
+  bool input{false};
 };
 
 // Rendering result.  Move-only; cheap to construct (no GPU resources).

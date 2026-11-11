@@ -290,7 +290,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   };
 
   if (ld.kind == OpId::Delta || ld.kind == OpId::Rle || ld.kind == OpId::For ||
-      ld.kind == OpId::Zigzag || ld.kind == OpId::Bitpack) {
+      ld.kind == OpId::Zigzag || ld.kind == OpId::Dict || ld.kind == OpId::Bitpack) {
     return make_fused_rep(ld.kind);
   }
   if (ld.kind == OpId::Identity) {
