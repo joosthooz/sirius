@@ -39,6 +39,7 @@
 //   * Rle     : rle_runs_offsets
 //   * For     : references (one per chunk)
 //   * Zigzag  : zigzag (leaf store); no channel when inline-fused
+//   * Dict    : keys (the range ballot also takes their count, see length_only)
 //
 // `buffers` lists those channels in the order the kernel expects them;
 // the launcher binds device pointers by (node_id, field) and pushes
@@ -147,6 +148,9 @@ struct DecodeBufferSpec {
   std::int32_t node_id;
   std::string field;      // "chunk_min", "packed", "delta_first", ...
   std::size_t elem_size;  // bytes/elem of the channel's logical dtype
+  /// The slot takes the channel's element count as an int64_t instead of its pointer (the Dict
+  /// range ballot searches its keys, so it needs their number).
+  bool length_only = false;
 };
 
 // One trailing kernel parameter — those following the fixed `(out, n)` pair.

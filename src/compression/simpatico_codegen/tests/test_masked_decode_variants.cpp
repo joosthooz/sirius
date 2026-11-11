@@ -888,12 +888,14 @@ bool run_delta_masked(const std::string& dtype, int arch)
   return true;
 }
 
-// A Dict root over bitpacked codes takes the generic seams: the masked
-// compacting decode stages the gathered keys and masked-stores them, and the
-// ballot compares them against the range. `keys` are sparse, so the
-// dictionary is worth building; `wide` spreads them past the bitmap range.
+// A Dict root over bitpacked codes: the masked compacting decode takes the
+// generic seam (stage the gathered keys, masked-store them), and the ballot
+// searches the sorted keys for the range's code bounds and compares codes.
+// `keys` are sparse, so the dictionary is worth building; `wide` spreads them
+// past the bitmap range; `num_keys` past 32 makes the key search take several
+// rounds.
 template <typename Element>
-bool run_dict_masked(const std::string& dtype, bool wide, int arch)
+bool run_dict_masked(const std::string& dtype, bool wide, int arch, std::int64_t num_keys = 40)
 {
   const std::int64_t n  = 4 * kChunk + 333;
   const std::int64_t nc = codegen::num_chunks_for(n);
@@ -901,14 +903,15 @@ bool run_dict_masked(const std::string& dtype, bool wide, int arch)
   const char* label = wide ? "search" : "bitmap";
 
   std::vector<Element> keys;
-  for (std::int64_t k = 0; k < 40; ++k)
-    keys.push_back(static_cast<Element>((k - 20) * (wide ? 50'000'011 : 9'973)));
+  for (std::int64_t k = 0; k < num_keys; ++k)
+    keys.push_back(static_cast<Element>((k - num_keys / 2) * (wide ? 50'000'011 : 9'973)));
+  const std::size_t lone = std::min<std::size_t>(7, keys.size() - 1);
   std::vector<Element> data(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i) {
     std::uint64_t s = 0xD1C7ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(i + 1));
     // Chunk 2 holds one key (a zero-width code chunk).
     data[static_cast<std::size_t>(i)] =
-      keys[(i / kChunk == 2) ? 7 : static_cast<std::size_t>(splitmix64(s) % keys.size())];
+      keys[(i / kChunk == 2) ? lone : static_cast<std::size_t>(splitmix64(s) % keys.size())];
   }
 
   auto tree =
@@ -965,14 +968,25 @@ bool run_dict_masked(const std::string& dtype, bool wide, int arch)
               label,
               static_cast<long long>(survivors));
 
+  constexpr std::int64_t kMin   = std::numeric_limits<std::int64_t>::min();
+  constexpr std::int64_t kMax   = std::numeric_limits<std::int64_t>::max();
+  const auto key                = [&](std::size_t k) { return static_cast<std::int64_t>(keys[k]); };
+  const std::size_t last        = keys.size() - 1;
   const range_predicate preds[] = {
-    {static_cast<std::int64_t>(keys[10]), static_cast<std::int64_t>(keys[25])},
-    {static_cast<std::int64_t>(keys[0]), static_cast<std::int64_t>(keys[39])},
-    {static_cast<std::int64_t>(keys[3]) + 1, static_cast<std::int64_t>(keys[4]) - 1},
+    {key(last / 4), key(3 * last / 4)},
+    {key(0), key(last)},
+    {key(1) + 1, key(2) - 1},
+    {kMin, key(0) - 1},
+    {key(last) + 1, kMax},
+    {kMin, kMax},
+    {key(lone), key(lone)},
+    {key(1) + 1, key(last - 1) - 1},
+    {kMin, key(last / 2)},
   };
-  const char* names[]      = {"mid", "all", "none"};
+  const char* names[] = {
+    "mid", "all", "none", "below", "above", "unbounded", "chunk2-key", "between", "low-half"};
   const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
-  for (int p = 0; p < 3; ++p) {
+  for (std::size_t p = 0; p < std::size(preds); ++p) {
     CUdeviceptr d_mask = enc.alloc(nwords * 4);
     cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
     selection_mask out_mask;
@@ -1800,6 +1814,8 @@ int main()
     run_dict_masked<std::int64_t>("int64_t", /*wide=*/false, arch);
     run_dict_masked<std::int64_t>("int64_t", /*wide=*/true, arch);
     run_dict_masked<std::int32_t>("int32_t", /*wide=*/false, arch);
+    run_dict_masked<std::int64_t>("int64_t", /*wide=*/true, arch, /*num_keys=*/2000);
+    run_dict_masked<std::int16_t>("int16_t", /*wide=*/false, arch, /*num_keys=*/6);
     run_dict_gather(/*key_width=*/1, arch);
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
     // The str_split gather (shallow and deep offsets chains).

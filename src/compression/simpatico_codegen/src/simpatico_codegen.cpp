@@ -321,7 +321,7 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 //   Statically, before any device work: a column asking for a compacted route
 //           must probe as that route; `full` is admitted for anything, with its
 //           economics deferred below. Range-filter sources are exempt and
-//           forced to bitpack_mask.
+//           forced to their plan's mask-producing route (bitpack_mask / dict_mask).
 //   Dynamically, once the survivor count is known — both regimes report
 //           declined_unselective, so the caller can remember it for the scan:
 //           - any `full` output: proceed iff survivors/rows <= TIERB_MAX_SEL
@@ -427,7 +427,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // decodes compacted but cannot ballot a numeric range, and one arriving as
     // a range source would be a latent wrong-mask gate.
     if (!probe_column(*table.columns[selected[f.column]].plan_tree).can_produce_mask())
-      return refuse("filter column plan is not a bitpack-rooted range source");
+      return refuse("filter column plan is not a bitpack- or dict-rooted range source");
   }
   for (auto const& b : request.bool8_filters) {
     if (b.column >= selected.size()) return refuse("bool8 directive column out of range");
@@ -465,12 +465,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // is known (a full-width decode plus gather costs about the unfiltered path,
   // so only low-selectivity batches pay off; measured losses at high
   // selectivity: q1 +43.5%, q5 +6.2%). Range-filter source columns are exempt
-  // from the check (probed bitpack-rooted above) and forced to bitpack_mask;
+  // from the check (probed as mask producers above) and forced to their own route;
   // dictionary-answered sources get no exemption — they carry their own
   // route.
   std::vector<sc::decode_route> routes(request.routes.begin(), request.routes.end());
   for (auto const& f : request.filters)
-    routes[f.column] = sc::decode_route::bitpack_mask;
+    routes[f.column] = probe_column(*table.columns[selected[f.column]].plan_tree).compact_route;
   for (size_t i = 0; i < selected.size(); ++i) {
     if (is_bool8_slot[i]) continue;  // the slot's output is the compacted BOOL8 answer
     // `full` is always available — every plan decodes full width, and a
@@ -741,7 +741,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     //    (default 0.10) — a full decode plus gather costs about the unfiltered
     //    path, so only a near-empty survivor set pays for the compacted batch.
     //  * no `full`: the 0.35 write-skip threshold (the mask walk costs about
-    //    the plain decode at sel .5) covering bitpack_mask / delta_mask AND
+    //    the plain decode at sel .5) covering bitpack_mask / delta_mask / dict_mask AND
     //    str_split (whose char-gather savings are dictionary-like in shape but
     //    weak at ~1-char widths — deliberately NOT exempt until measurements
     //    say otherwise), with only a dict_codes output
@@ -790,8 +790,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
 
     // Per-batch enumeration pick for bitpack_mask outputs: walk the survivor
     // index list below the crossover, walk the mask bits above it. delta_mask
-    // always walks the mask (the index walk rejects delta roots at render); the
-    // dictionary route is unchanged.
+    // and dict_mask always walk the mask (the index walk renders only a bitpack
+    // leaf); the dictionary route is unchanged.
     bool any_bitpack_mask = false;
     for (auto const t : routes)
       any_bitpack_mask |= t == sc::decode_route::bitpack_mask;
@@ -1105,9 +1105,11 @@ std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& tab
     if (error_out) { *error_out = "decompress_column_rows: the row set is not valid"; }
     return nullptr;
   }
-  // Only the bitpack compacted decode reads a row set, and discovering that
-  // costs no device work.
-  if (probe_column(*tree).compact_route != sirius::codegen::decode_route::bitpack_mask) {
+  // Only the bitpack and dict compacted decodes read a row set, and discovering
+  // that costs no device work.
+  auto const route = probe_column(*tree).compact_route;
+  if (route != sirius::codegen::decode_route::bitpack_mask &&
+      route != sirius::codegen::decode_route::dict_mask) {
     if (error_out) {
       *error_out = "decompress_column_rows: this plan has no random-access decode for a row set";
     }
@@ -1117,7 +1119,7 @@ std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& tab
   decode_selection sel;
   sel.rows           = &rows;
   sel.survivor_count = rows.num_survivors;
-  sel.route          = sirius::codegen::decode_route::bitpack_mask;
+  sel.route          = route;
 
   return decode_complete_column(
     *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
@@ -1228,28 +1230,31 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   result = sirius::codegen::scan_filter_result{};
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, streams, mr)) {
     if (sirius::codegen::decompression_pushdown_diag_enabled()) {
-      int n_a = 0, n_delta = 0, n_dict = 0, n_str_split = 0, n_b = 0;
+      int n_a = 0, n_delta = 0, n_dict = 0, n_str_split = 0, n_dict_mask = 0, n_b = 0;
       for (auto const t : result.routes) {
         n_a += t == sirius::codegen::decode_route::bitpack_mask;
         n_delta += t == sirius::codegen::decode_route::delta_mask;
         n_dict += t == sirius::codegen::decode_route::dict_codes;
         n_str_split += t == sirius::codegen::decode_route::str_split;
+        n_dict_mask += t == sirius::codegen::decode_route::dict_mask;
         n_b += t == sirius::codegen::decode_route::full;
       }
-      std::fprintf(stderr,
-                   "simpatico: filtered decode applied: survivors=%lld/%lld "
-                   "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu "
-                   "delivered=%zu/%zu\n",
-                   static_cast<long long>(result.survivor_count),
-                   static_cast<long long>(result.num_rows),
-                   n_a,
-                   n_delta,
-                   n_dict,
-                   n_str_split,
-                   n_b,
-                   request.filters.size() + request.bool8_filters.size(),
-                   result.routes.size(),
-                   selected_columns.size());
+      std::fprintf(
+        stderr,
+        "simpatico: filtered decode applied: survivors=%lld/%lld "
+        "routes bitpack=%d delta=%d dict=%d str_split=%d dict_mask=%d full=%d sources=%zu "
+        "delivered=%zu/%zu\n",
+        static_cast<long long>(result.survivor_count),
+        static_cast<long long>(result.num_rows),
+        n_a,
+        n_delta,
+        n_dict,
+        n_str_split,
+        n_dict_mask,
+        n_b,
+        request.filters.size() + request.bool8_filters.size(),
+        result.routes.size(),
+        selected_columns.size());
     }
     // Every route, including `full` and the dictionary-answered BOOL8 slots, came back
     // survivor-sized and completed.

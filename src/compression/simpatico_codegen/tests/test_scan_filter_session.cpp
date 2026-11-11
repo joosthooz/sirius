@@ -884,6 +884,140 @@ void dict_codes_gather(simpatico::stream_pool& pool,
   expect(rejected, "dict_codes gather accepted a key width hint that contradicts the key chars");
 }
 
+template <typename T>
+std::unique_ptr<cudf::column> column_of(std::vector<T> const& values,
+                                        cudf::type_id type,
+                                        ::cuda::stream_ref stream,
+                                        rmm::device_async_resource_ref mr)
+{
+  auto column = cudf::make_fixed_width_column(cudf::data_type{type},
+                                              static_cast<cudf::size_type>(values.size()),
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              mr);
+  cuda_check(cudaMemcpyAsync(column->mutable_view().head<T>(),
+                             values.data(),
+                             values.size() * sizeof(T),
+                             cudaMemcpyHostToDevice,
+                             stream.get()));
+  stream.sync();
+  return column;
+}
+
+// A fixed-width Dict root decodes compacted under another column's range (dict_mask consumes the
+// mask) and ballots its own range on the codes (dict_mask produces it). A Dict over doubles
+// decodes compacted too, but its keys are in bit-pattern order, so it must not ballot a range.
+void dict_mask_route(simpatico::stream_pool& pool,
+                     ::cuda::stream_ref stream,
+                     rmm::device_async_resource_ref mr)
+{
+  std::vector<std::int32_t> keys;
+  for (int k = 0; k < 40; ++k)
+    keys.push_back((k - 20) * 9973);
+  std::vector<std::int32_t> values(row_count);
+  for (int i = 0; i < row_count; ++i)
+    values[i] = keys[(i * 7 + i / 13) % keys.size()];
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(column_of(values, cudf::type_id::INT32, stream, mr));
+  columns.push_back(sequence(0, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed = simpatico::compress_with_plan(
+    input.view(),
+    "input -> dict -> codes, keys\ndict.codes -> bitpack\n---\ninput -> bitpack\n",
+    stream,
+    mr);
+  auto const& tree = *compressed.columns[0].plan_tree;
+  auto const caps  = simpatico::probe_column(tree);
+  expect(caps.compact_route == sc::decode_route::dict_mask && caps.can_produce_mask() &&
+           !caps.can_answer_equality,
+         "an integer Dict root probes as a dict_mask range source");
+  std::array<std::size_t, 2> selected{0, 1};
+
+  // Consume: the range is on the bitpack column.
+  sc::scan_filter_request request;
+  request.routes = {sc::decode_route::dict_mask, sc::decode_route::bitpack_mask};
+  request.filters.push_back({1, {100, 139}});
+  sc::scan_filter_result result;
+  auto output =
+    simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+  expect(result.applied && result.survivor_count == 40 &&
+           result.routes.front() == sc::decode_route::dict_mask,
+         "dict_mask consumes a bitpack range mask");
+  expect(read<std::int32_t>(output->view().column(0), stream) ==
+           std::vector<std::int32_t>(values.begin() + 100, values.begin() + 140),
+         "dict_mask compacted values");
+  output.reset();
+
+  // Produce: the range is on the Dict column, with bounds between keys.
+  std::int64_t const lo = keys[11] - 5, hi = keys[13] + 5;
+  std::vector<std::int32_t> want_values, want_rows;
+  for (int i = 0; i < row_count; ++i) {
+    if (values[i] >= lo && values[i] <= hi) {
+      want_values.push_back(values[i]);
+      want_rows.push_back(i);
+    }
+  }
+  request.routes = {sc::decode_route::dict_mask, sc::decode_route::bitpack_mask};
+  request.filters.assign({{0, {lo, hi}}});
+  output =
+    simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+  expect(result.applied && result.survivor_count == static_cast<std::int64_t>(want_rows.size()),
+         "dict_mask produces a range mask on its codes");
+  expect(read<std::int32_t>(output->view().column(0), stream) == want_values &&
+           read<std::int32_t>(output->view().column(1), stream) == want_rows,
+         "dict_mask range survivors");
+  output.reset();
+
+  // The same ballot through the single-column entry point, against a host mask.
+  rmm::device_buffer words(
+    static_cast<std::size_t>(sc::selection_mask::AllocWordsFor(row_count)) * sizeof(std::uint32_t),
+    stream,
+    mr);
+  std::string error;
+  expect(simpatico::decompress_column_selection_mask(
+           tree, {lo, hi}, static_cast<std::uint32_t*>(words.data()), stream, mr, &error),
+         error.c_str());
+  std::vector<std::uint32_t> got(static_cast<std::size_t>(row_count + 31) / 32);
+  cuda_check(cudaMemcpyAsync(got.data(),
+                             words.data(),
+                             got.size() * sizeof(std::uint32_t),
+                             cudaMemcpyDeviceToHost,
+                             stream.get()));
+  stream.sync();
+  std::vector<std::uint32_t> want(got.size(), 0);
+  for (auto const row : want_rows)
+    want[row / 32] |= std::uint32_t{1} << (row % 32);
+  expect(got == want, "dict_mask single-column range ballot");
+
+  std::vector<double> doubles(row_count);
+  for (int i = 0; i < row_count; ++i)
+    doubles[i] = static_cast<double>(values[i]) / 7.0;
+  std::vector<std::unique_ptr<cudf::column>> double_columns;
+  double_columns.push_back(column_of(doubles, cudf::type_id::FLOAT64, stream, mr));
+  double_columns.push_back(sequence(0, stream, mr));
+  cudf::table double_input{std::move(double_columns)};
+  auto floating = simpatico::compress_with_plan(
+    double_input.view(),
+    "input -> dict -> codes, keys\ndict.codes -> bitpack\n---\ninput -> bitpack\n",
+    stream,
+    mr);
+  auto const float_caps = simpatico::probe_column(*floating.columns[0].plan_tree);
+  expect(float_caps.compact_route == sc::decode_route::dict_mask && !float_caps.can_produce_mask(),
+         "a floating-point Dict decodes compacted but is no range source");
+  request.routes = {sc::decode_route::dict_mask, sc::decode_route::bitpack_mask};
+  request.filters.assign({{0, {0, 100}}});
+  output = simpatico::decompress_scan_filter(floating, selected, request, result, pool, stream, mr);
+  expect(!result.applied && result.status == sc::scan_filter_status::refused,
+         "a range on a floating-point Dict is refused");
+  output.reset();
+  request.filters.assign({{1, {0, 19}}});
+  output = simpatico::decompress_scan_filter(floating, selected, request, result, pool, stream, mr);
+  expect(result.applied && result.survivor_count == 20 &&
+           read<double>(output->view().column(0), stream) ==
+             std::vector<double>(doubles.begin(), doubles.begin() + 20),
+         "a floating-point Dict consumes a mask");
+}
+
 }  // namespace
 
 int main()
@@ -914,6 +1048,7 @@ int main()
     bool8_delivery(pool, stream, resource);
     nullable_bool8_declines(pool, stream, resource);
     dict_codes_gather(pool, stream, resource);
+    dict_mask_route(pool, stream, resource);
     nullable_full_route_declines(pool, stream, resource);
     aliased_borrowed_lanes(pool, stream, resource);
     cuda_check(pool.sync_all());

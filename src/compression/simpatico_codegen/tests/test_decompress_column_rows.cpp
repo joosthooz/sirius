@@ -94,18 +94,18 @@ std::vector<std::int32_t> read_int32(cudf::column_view const& col, ::cuda::strea
   return host;
 }
 
-/// Decode `selected` sparsely and require it to equal the full decode's own
-/// rows at those positions.
+/// Decode `selected` sparsely under `plan` and require it to equal the full
+/// decode's own rows at those positions.
 void check_against_full_decode(char const* label,
                                std::int64_t num_rows,
-                               std::vector<std::int64_t> const& selected)
+                               std::vector<std::int64_t> const& selected,
+                               char const* plan)
 {
   auto const stream = cudf::get_default_stream();
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   auto input = make_int32_table(1, static_cast<int>(num_rows), 7);
-  auto ct =
-    simpatico::compress_with_plan(input->view(), "input -> bitpack -> packed\n", stream, mr);
+  auto ct    = simpatico::compress_with_plan(input->view(), plan, stream, mr);
 
   auto const full     = simpatico::decompress(ct, stream, mr);
   auto const all_rows = read_int32(full->view().column(0), stream);
@@ -132,6 +132,24 @@ void check_against_full_decode(char const* label,
                    want);
       throw std::runtime_error("sparse decode does not match the full decode");
     }
+  }
+}
+
+/// The plans with a sparse walk: a bitpack root, and a Dict root (whose 1000
+/// keys every fixture below has room for) gathering its keys by the codes.
+constexpr char const* kPlans[] = {
+  "input -> bitpack -> packed\n",
+  "input -> dict -> codes, keys\ndict.codes -> bitpack\n",
+};
+
+/// Decode `selected` sparsely and require it to equal the full decode's own
+/// rows at those positions.
+void check_against_full_decode(char const* label,
+                               std::int64_t num_rows,
+                               std::vector<std::int64_t> const& selected)
+{
+  for (auto const* plan : kPlans) {
+    check_against_full_decode(label, num_rows, selected, plan);
   }
 }
 

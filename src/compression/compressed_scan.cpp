@@ -620,7 +620,7 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
     any_unbounded = any_unbounded || route == sirius::codegen::decode_route::dict_codes ||
                     route == sirius::codegen::decode_route::str_split;
     // A range conjunct on this column can only drive compaction if this
-    // column's own plan can PRODUCE the mask (bitpack_mask); delta_mask,
+    // column's own plan can PRODUCE the mask (bitpack_mask, dict_mask); delta_mask,
     // dict_codes and str_split can only CONSUME an already-produced one —
     // see column_decode_caps::can_produce_mask. Without at least one
     // mask-producing range column, planning drops every range conjunct and

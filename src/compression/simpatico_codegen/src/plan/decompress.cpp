@@ -1134,7 +1134,9 @@ validated_selection::validated_selection(PlanTree const& plan, decode_selection 
     throw std::invalid_argument("decode: requested route does not match the plan");
   }
   if (selection.rows) {
-    if (selection.route != sc::decode_route::bitpack_mask || selection.rows->num_rows < 0 ||
+    if ((selection.route != sc::decode_route::bitpack_mask &&
+         selection.route != sc::decode_route::dict_mask) ||
+        selection.rows->num_rows < 0 ||
         selection.rows->num_rows > std::numeric_limits<cudf::size_type>::max() ||
         !selection.rows->valid() || selection.rows->num_survivors != selection.survivor_count) {
       throw std::invalid_argument("decode: invalid compacted chunk row set");
@@ -1387,6 +1389,14 @@ bool str_split_selection_root(PlanTree const& tree)
   return locate_str_split_shape(tree).has_value();
 }
 
+// A fixed-width Dict root: it always roots its own fused region, so the masked decode and the
+// range ballot render on it directly whatever its codes child is.
+bool dict_mask_selection_root(PlanTree const& tree)
+{
+  NodeId const nid = root_value_producer(tree);
+  return nid < tree.nodes.size() && tree.nodes[nid].op == "dict";
+}
+
 bool dict_codes_selection_root(PlanTree const& tree)
 {
   if (tree.nodes.empty() || tree.nodes[0].op != "input") { return false; }
@@ -1434,6 +1444,13 @@ column_decode_caps probe_column(PlanTree const& tree)
     caps.compact_route = sc::decode_route::dict_codes;
   } else if (str_split_selection_root(tree)) {
     caps.compact_route = sc::decode_route::str_split;
+  } else if (dict_mask_selection_root(tree)) {
+    caps.compact_route = sc::decode_route::dict_mask;
+    if (auto const* rep = node_rep(root_value_producer(tree), tree)) {
+      auto const type = rep->decoded_type();
+      caps.range_comparable_lane =
+        cudf::size_of(type) <= sizeof(std::int64_t) && !cudf::is_floating_point(type);
+    }
   }
   caps.can_answer_equality = dictionary_value_root(tree);
   return caps;

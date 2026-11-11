@@ -122,7 +122,7 @@ struct decode_selection {
   /// from, which is the whole reason this form exists, so @c survivor_count must
   /// be set from the row set and the mask may be null.
   ///
-  /// Only @c decode_route::bitpack_mask is served this way. The other routes
+  /// Only @c decode_route::bitpack_mask and @c dict_mask are served this way. The other routes
   /// read the mask directly (str_split reconstruct, dictionary gather) or need
   /// the survivor index list (@c full), and are refused rather than silently
   /// decoded full width — the same footing the index walk was introduced on.
@@ -180,8 +180,8 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 ///
 /// One probe, so a capability and the route that implements it cannot drift
 /// apart: @c compact_route == @c full IS "cannot decode compacted", and only a
-/// bitpack root can evaluate a predicate while decoding, which is exactly
-/// @c bitpack_mask.
+/// bitpack or dict root can evaluate a predicate while decoding, which is exactly
+/// @c bitpack_mask and @c dict_mask.
 struct column_decode_caps {
   /// The route this plan's shape takes under a selection mask:
   ///   bitpack_mask — a `bitpack` root (mask_consume on the root region),
@@ -199,6 +199,10 @@ struct column_decode_caps {
   ///                  widened (>2 GB, non-UINT8) chars stay `full` — widen only
   ///                  in lockstep with the renderer's masked
   ///                  offsets-reconstruction coverage,
+  ///   dict_mask    — a non-null fixed-width `dict` root: the codes decode
+  ///                  under the mask and the survivors gather their keys. It
+  ///                  also ballots a range, on the codes: the keys are sorted,
+  ///                  so [lo,hi] is one contiguous code range,
   ///   full         — everything else: decode full width, then gather.
   /// A nullable column (non-empty PlanTree::validity) reports @c full throughout:
   /// selection has no null model yet.
@@ -211,21 +215,25 @@ struct column_decode_caps {
   bool can_answer_equality = false;
 
   /// The root decodes into a lane of at most 64 bits. The range ballot compares in int64, so a
-  /// wider lane (DECIMAL128) can decode compacted but cannot ballot a range.
+  /// wider lane (DECIMAL128) can decode compacted but cannot ballot a range. A Dict over
+  /// floating-point values is excluded too: its keys are sorted by bit pattern, which is not the
+  /// value order for negative floats.
   bool range_comparable_lane = true;
 
   /// The plan can ballot its rows into selection-mask words, which the render
-  /// supports for bitpack roots of at most 64 bits only.
+  /// supports for bitpack and dict roots of at most 64 bits only.
   [[nodiscard]] bool can_produce_mask() const noexcept
   {
-    return compact_route == sirius::codegen::decode_route::bitpack_mask && range_comparable_lane;
+    return (compact_route == sirius::codegen::decode_route::bitpack_mask ||
+            compact_route == sirius::codegen::decode_route::dict_mask) &&
+           range_comparable_lane;
   }
 };
 
 /// Probe @p tree once for everything a decode needs to know about it.
 column_decode_caps probe_column(PlanTree const& tree);
 
-/// Wave 1: decode @p tree's root bitpack region fused with the inclusive
+/// Wave 1: decode @p tree's root bitpack or dict region fused with the inclusive
 /// decoded-domain range @p pred, writing selection-mask words into
 /// @p mask_words — NO column output is allocated or written. @p mask_words
 /// must hold ``selection_mask::AllocWordsFor(num_rows)`` words; every word of

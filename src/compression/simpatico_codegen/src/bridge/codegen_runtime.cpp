@@ -672,7 +672,8 @@ void launch_rendered_decode(jit::FusedTree const& tree,
                                   std::to_string(found->second.length) +
                                   " entries; grid requires " + std::to_string(required));
     }
-    pointers.push_back(reinterpret_cast<CUdeviceptr>(found->second.ptr));
+    pointers.push_back(buffer.length_only ? static_cast<CUdeviceptr>(found->second.length)
+                                          : reinterpret_cast<CUdeviceptr>(found->second.ptr));
   }
 
   auto output = reinterpret_cast<CUdeviceptr>(out);

@@ -117,6 +117,10 @@ struct range_predicate {
 //                 but WEAKER at ~1-char average widths, so it stays under the
 //                 ordinary selectivity ceiling rather than taking the
 //                 dictionary exemption — move it only if measurements say so.
+//   dict_mask   — a fixed-width Dict root (sorted keys, int32 codes): the codes
+//                 decode under the mask and only the survivors' keys are
+//                 gathered. A fixed-width write skip like bitpack_mask, so it
+//                 stays under the ordinary selectivity ceiling.
 //
 // `full` IS "not compactable", so there is no separate capability flag to keep
 // consistent with the route: the two cannot disagree. Never serialized — the
@@ -127,6 +131,7 @@ enum class decode_route : uint8_t {
   delta_mask,
   dict_codes,
   str_split,
+  dict_mask,
 };
 
 // True for routes wave 2 decodes compacted in one pass. `full` is NOT in this
@@ -234,7 +239,8 @@ struct scan_filter_result {
   int64_t num_rows           = 0;                            // pre-filter batch rows
   int64_t survivor_count     = -1;
   std::vector<decode_route> routes;  // EFFECTIVE route per DELIVERED output: the requested route,
-                                     // or bitpack_mask for a range-filter source column
+                                     // or the plan's own mask-producing route (bitpack_mask /
+                                     // dict_mask) for a range-filter source column
   rmm::device_buffer mask_words;     // uint32 x WordsFor(num_rows) (full chunk strips)
   rmm::device_buffer chunk_offsets;  // uint32 x (ChunksFor(num_rows)+1)
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no

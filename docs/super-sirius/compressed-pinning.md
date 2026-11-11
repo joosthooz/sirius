@@ -131,6 +131,7 @@ follows from the compressor at its root:
 | `delta -> bitpack` | the chunk is still reconstructed (a prefix sum is sequential), but only survivors are STORED — saves the full-width write and the downstream compaction |
 | `dictionary` with bitpack codes | answers string equality/IN off the key set, and gathers only surviving keys. Wins 2.1-2.6x at EVERY selectivity, since it skips the string materialization round trip |
 | `str_split` | reconstructs offsets under the mask and gathers only the survivors' chars |
+| `dict` (fixed-width, sorted keys) | evaluates ranges on the codes (the range becomes one code range, found by searching the sorted keys) and gathers only the survivors' keys. Not for floating-point columns, whose keys are in bit-pattern order |
 | anything else (`identity`, entropy-coded, ...) | decodes full width and is compacted by a gather, which is admitted only when few rows survive |
 
 So a plan chosen purely for ratio can cost row-skipping. `input -> identity` is the right GPU-tier
