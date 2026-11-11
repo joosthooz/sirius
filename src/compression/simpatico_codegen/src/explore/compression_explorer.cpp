@@ -9,6 +9,7 @@
 
 #include "explore/compression_explorer.hpp"
 
+#include "codegen/bridge/dict_keys.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"     // copy_column_view
 #include "codegen/plan/operator_registry.hpp"  // is_terminal_compressor
 #include "codegen/plan/plan_interpreter.hpp"
@@ -16,6 +17,8 @@
 #include "codegen/plan/validity.hpp"
 
 #include <cudf/copying.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -65,13 +68,45 @@ double time_cuda_ms(cudaStream_t stream, Fn&& fn)
 inline bool weights_need_timing(double const w[3]) { return w[1] != 0.0 || w[2] != 0.0; }
 
 // Relative decode cost per codec (beam-retention proxy), accumulated as cost x bytes processed.
-inline double op_decode_cost(std::string_view op)
+// A dict decode gathers from its keys, which slows once they outgrow L1.
+inline double op_decode_cost(std::string_view op, std::size_t dict_keys_bytes = 0)
 {
+  if (op == "dict") {
+    constexpr double kL1Bytes = 32 * 1024;
+    return 1.0 + 0.15 * std::max(0.0, std::log2(static_cast<double>(dict_keys_bytes) / kL1Bytes));
+  }
   if (op == "identity" || op == "str_split") return 0.15;
   if (op == "deflate" || op == "lz4" || op == "snappy" || op == "cascaded") return 5.0;
   if (op == "dictionary") return 3.0;
   if (op == "ans" || op == "bitcomp" || op == "alp" || op == "alp_rd") return 2.0;
   return 1.0;  // bitpack, rle, delta, zigzag, for, dict, bitextract — fast
+}
+
+// max - min of a fixed-width column's values as signed integers of their width, the order the
+// dict encoder keys them in.
+template <typename T>
+std::uint64_t integer_span(cudf::column_view col,
+                           ::cuda::stream_ref stream,
+                           rmm::device_async_resource_ref mr)
+{
+  cudf::column_view const bits{
+    cudf::data_type{cudf::type_to_id<T>()}, col.size(), col.head(), nullptr, 0, col.offset()};
+  auto const [lo, hi] = cudf::minmax(bits, stream, mr);
+  using U             = std::make_unsigned_t<T>;
+  return static_cast<U>(static_cast<cudf::numeric_scalar<T> const&>(*hi).value(stream)) -
+         static_cast<U>(static_cast<cudf::numeric_scalar<T> const&>(*lo).value(stream));
+}
+
+std::uint64_t integer_span(cudf::column_view col,
+                           ::cuda::stream_ref stream,
+                           rmm::device_async_resource_ref mr)
+{
+  switch (cudf::size_of(col.type())) {
+    case 1: return integer_span<std::int8_t>(col, stream, mr);
+    case 2: return integer_span<std::int16_t>(col, stream, mr);
+    case 4: return integer_span<std::int32_t>(col, stream, mr);
+    default: return integer_span<std::int64_t>(col, stream, mr);
+  }
 }
 
 inline double weighted_score(double ratio, double comp, double decomp, double const w[3])
@@ -433,6 +468,15 @@ operator_trial try_operator(std::string const& name,
     }
     r.outputs = rep->named_channels(stream);
     r.repr    = std::shared_ptr<compressed_representation>(std::move(rep));
+    if (name == "dict" && col.size() > 0) {
+      auto const keys = std::find_if(
+        r.outputs.begin(), r.outputs.end(), [](auto const& o) { return o.name == "keys"; });
+      if (keys != r.outputs.end() &&
+          !dict_codes_pay(keys->view.size(), integer_span(col, stream, mr))) {
+        r.error_message = "dict: codes no narrower than the value range";
+        return r;
+      }
+    }
     for (auto const& o : r.outputs) {
       r.output_bytes += column_size_bytes_ex(o.view, stream);
     }
@@ -673,7 +717,8 @@ exploration_result explore_column_compression(cudf::column_view input,
 
           bool is_term = is_terminal_compressor(op_name);
           std::vector<std::string> step_out_paths;
-          size_t step_out_total = 0;
+          size_t step_out_total  = 0;
+          size_t dict_keys_bytes = 0;
           for (auto const& out : trial.outputs) {
             std::string out_path =
               (pend.path == "input") ? op_name + "." + out.name : pend.path + "." + out.name;
@@ -686,6 +731,7 @@ exploration_result explore_column_compression(cudf::column_view input,
             child->path_size[out_path] = out_sz;
             step_out_paths.push_back(out_path);
             step_out_total += out_sz;
+            if (op_name == "dict" && out.name == "keys") dict_keys_bytes = out_sz;
           }
           child->steps.push_back({dsl_line.str(),
                                   pend.path,
@@ -703,8 +749,8 @@ exploration_result explore_column_compression(cudf::column_view input,
           for (auto const& p : child->pending)
             child->total_leaf_bytes += p.size_bytes;
           child->compression_ratio = (double)original_size / child->total_leaf_bytes;
-          child->decode_cost =
-            candidate->decode_cost + op_decode_cost(op_name) * (double)pend.size_bytes;
+          child->decode_cost       = candidate->decode_cost +
+                               op_decode_cost(op_name, dict_keys_bytes) * (double)pend.size_bytes;
 
           if (child->compression_ratio > best_ratio) {
             best_ratio      = child->compression_ratio;

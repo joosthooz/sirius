@@ -18,6 +18,8 @@
 //     decode manifest needs it. We synthesize the per-chunk offsets {0, stride,
 //     2*stride, ...} from the OverAllocate slot stride so the Compact decode
 //     gather reads the padded buffer directly.
+//   * Dict inputs — the dictionary a Dict root's kernel reads is built from the
+//     column first, as the production launcher does (build_dict_keys).
 //
 // Mixing note: device buffers come from the RMM async pool (runtime API);
 // the encode kernel is launched via the driver API (`cuLaunchKernel` — it's
@@ -28,6 +30,7 @@
 
 #pragma once
 
+#include "codegen/bridge/dict_keys.hpp"
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
@@ -42,6 +45,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -136,7 +140,7 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
 
   // Reserve so the per-spec emplace_backs never reallocate `owned` (keeps
   // the captured d_flat / buf_ptrs raw pointers below trivially valid).
-  out.owned.reserve(1 + spec.buffers.size());
+  out.owned.reserve(1 + spec.buffers.size() + 4);
 
   // 2. Upload the flat input column (pool buffer + async H2D).
   const std::size_t flat_bytes =
@@ -156,7 +160,26 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   //    the raw pointers in spec order for the launch arg vector.
   std::vector<CUdeviceptr> buf_ptrs;
   buf_ptrs.reserve(spec.buffers.size());
+  std::optional<simpatico::dict_keys> dict;
   for (const auto& b : spec.buffers) {
+    if (b.input) {
+      if (!dict) {
+        dict = simpatico::build_dict_keys(
+          reinterpret_cast<const void*>(d_flat), n, sizeof(Element), n, stream, mr);
+        if (!dict) throw std::runtime_error("gpu_encode_tree: dict declined the column");
+      }
+      const rmm::device_buffer& src = b.field == "dict_meta"     ? dict->meta
+                                      : b.field == "dict_bitmap" ? dict->bitmap
+                                      : b.field == "dict_rank"   ? dict->rank
+                                                                 : dict->keys;
+      const std::size_t len =
+        b.field == "keys" ? static_cast<std::size_t>(dict->num_keys) : src.size() / b.elem_size;
+      CUdeviceptr d = reinterpret_cast<CUdeviceptr>(src.data());
+      buf_ptrs.push_back(d);
+      out.buffers[jit::buffer_key(b.node_id, b.field)] =
+        jit::LabeledBuffer{reinterpret_cast<const void*>(d), len, b.elem_size};
+      continue;
+    }
     const std::size_t bytes       = b.length * b.elem_size;
     const std::size_t alloc_bytes = bytes == 0 ? 1 : bytes;
     out.owned.emplace_back(alloc_bytes, stream, mr);
@@ -202,6 +225,12 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
                           nullptr),
            "cuLaunchKernel(encode)");
   cu_check(cuCtxSynchronize(), "cuCtxSynchronize(encode)");
+  if (dict) {
+    out.owned.push_back(std::move(dict->meta));
+    out.owned.push_back(std::move(dict->bitmap));
+    out.owned.push_back(std::move(dict->rank));
+    out.owned.push_back(std::move(dict->keys));
+  }
 
   // 5. rle_runs_offsets fixup — inclusive scan in place.
   for (const auto& b : spec.buffers) {

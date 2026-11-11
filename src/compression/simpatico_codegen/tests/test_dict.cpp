@@ -4,6 +4,7 @@
 
 #include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
+#include "explore/compression_explorer.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -23,6 +24,8 @@ namespace {
 using simpatico::compress_with_plan;
 using simpatico::compressed_table;
 using simpatico::decompress;
+
+constexpr int kRows = 100'000;
 
 template <typename T>
 std::unique_ptr<cudf::table> make_table(cudf::type_id id, std::vector<T> const& host)
@@ -49,6 +52,25 @@ std::vector<T> draw(std::vector<T> const& keys, int n)
   return out;
 }
 
+bool declines(cudf::table_view input, std::string const& dsl)
+{
+  try {
+    compress_with_plan(
+      input, dsl, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+  } catch (std::exception const&) {
+    return true;
+  }
+  return false;
+}
+
+std::unique_ptr<cudf::table> draw_sparse_column()
+{
+  std::vector<std::int64_t> keys;
+  for (int k = 0; k < 50; ++k)
+    keys.push_back(k * 1'000'003);
+  return make_table(cudf::type_id::INT64, draw(keys, kRows));
+}
+
 compressed_table roundtrip(cudf::table_view input, std::string const& dsl, char const* label)
 {
   std::fprintf(stderr, "[dict] %s\n", label);
@@ -66,8 +88,6 @@ compressed_table roundtrip(cudf::table_view input, std::string const& dsl, char 
 constexpr char const* kDictBitpack =
   "input -> dict -> codes, keys\n"
   "dict.codes -> bitpack\n";
-
-constexpr int kRows = 100'000;
 
 void test_widths()
 {
@@ -108,7 +128,7 @@ void test_widths()
 
   std::vector<std::int32_t> days;
   for (int k = 0; k < 2526; ++k)
-    days.push_back(8035 + k);
+    days.push_back(8035 + k * 7);
   roundtrip(
     make_table(cudf::type_id::TIMESTAMP_DAYS, draw(days, kRows))->view(), kDictBitpack, "date");
 
@@ -124,11 +144,6 @@ void test_widths()
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
   roundtrip(cudf::table(std::move(cols)).view(), kDictBitpack, "decimal64");
-
-  // A single key; and a chunk tail shorter than a full chunk.
-  roundtrip(make_table(cudf::type_id::INT32, std::vector<std::int32_t>(5000, 42))->view(),
-            kDictBitpack,
-            "single_key");
 }
 
 void test_cascades()
@@ -146,16 +161,15 @@ void test_cascades()
             "dict.keys.differences -> bitpack\n",
             "keys_delta_bitpack");
   // A Dict below another op roots its own region over that op's stored stream.
-  roundtrip(make_table(cudf::type_id::INT32, std::vector<std::int32_t>(4096, 7))->view(),
-            "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed, chunk_divisors\n"
-            "bitpack.chunk_count -> dict -> codes, keys\n"
-            "bitpack.chunk_count.codes -> dict -> codes, keys\n",
-            "nested_dict");
-  roundtrip(t->view(),
-            "input -> for -> deltas, references\n"
-            "for.references -> delta -> differences\n"
-            "for.references.differences -> dict -> codes, keys\n",
-            "dict_below_delta");
+  std::vector<std::int64_t> runs(kRows);
+  for (int r = 0; r < kRows; ++r)
+    runs[static_cast<std::size_t>(r)] = keys[static_cast<std::size_t>((r / 37) % 40 * 100)];
+  roundtrip(make_table(cudf::type_id::INT64, runs)->view(),
+            "input -> rle -> runs, values\n"
+            "rle.runs -> bitpack\n"
+            "rle.values -> dict -> codes, keys\n"
+            "rle.values.codes -> bitpack\n",
+            "dict_below_rle");
   roundtrip(t->view(),
             "input -> dict -> codes, keys\n"
             "dict.codes -> rle -> values, runs\n"
@@ -181,6 +195,32 @@ void test_declines()
     threw = true;
   }
   expect(threw, "dict over the key cap should decline");
+
+  // Dense keys: codes no narrower than a frame-of-reference offset. An explicit plan still
+  // encodes them; the explorer passes on them.
+  std::vector<std::int32_t> dense;
+  for (int k = 0; k < 2526; ++k)
+    dense.push_back(8035 + k);
+  auto const dense_t  = make_table(cudf::type_id::INT32, draw(dense, kRows));
+  auto const single_t = make_table(cudf::type_id::INT32, std::vector<std::int32_t>(5000, 42));
+  roundtrip(dense_t->view(), kDictBitpack, "dense_keys");
+  roundtrip(single_t->view(), kDictBitpack, "single_key");
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+  expect(!simpatico::try_operator("dict", dense_t->view().column(0), stream, mr).success,
+         "explorer should pass on dict over dense keys");
+  expect(!simpatico::try_operator("dict", single_t->view().column(0), stream, mr).success,
+         "explorer should pass on dict over a single key");
+  expect(
+    simpatico::try_operator("dict", draw_sparse_column()->view().column(0), stream, mr).success,
+    "explorer should take dict over sparse keys");
+
+  // Wide, all distinct and long enough to be sampled: declines without the full sort.
+  std::vector<std::int64_t> wide(5'000'000);
+  for (std::size_t r = 0; r < wide.size(); ++r)
+    wide[r] = static_cast<std::int64_t>(r) * 1'000'003;
+  expect(declines(make_table(cudf::type_id::INT64, wide)->view(), kDictBitpack),
+         "dict over a wide distinct column should decline");
 
   roundtrip(make_table(cudf::type_id::INT32, std::vector<std::int32_t>{})->view(),
             kDictBitpack,

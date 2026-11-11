@@ -14,6 +14,8 @@
 #include <cuda_runtime.h>
 #include <thrust/copy.h>
 #include <thrust/extrema.h>
+#include <thrust/gather.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
@@ -30,6 +32,10 @@ namespace {
 // columns would otherwise funnel every row into a handful of global atomics.
 constexpr std::int32_t kPrivateBitmapWords = 8192;  // 32 KB
 constexpr int kMarkBlock                   = 256;
+
+// A wide-range column longer than this many times `max_keys` is first sampled: a strided sample
+// with more than `max_keys` distinct values proves the column has too, without sorting it all.
+constexpr std::int64_t kSampleFactor = 4;
 
 void check(cudaError_t e, char const* what)
 {
@@ -99,15 +105,25 @@ __global__ void emit_bitmap_keys(std::uint32_t const* __restrict__ bitmap,
   }
 }
 
+struct strided {
+  std::int64_t stride;
+  __device__ std::int64_t operator()(std::int64_t i) const { return i * stride; }
+};
+
 struct popcount_word {
   __device__ std::int32_t operator()(std::uint32_t w) const { return __popc(w); }
 };
 
 unsigned grid_for(std::int64_t n)
 {
-  int device = 0, sms = 0;
+  thread_local int cached_device = -1;
+  thread_local int sms           = 0;
+  int device                     = 0;
   check(cudaGetDevice(&device), "cudaGetDevice");
-  check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "SM count");
+  if (device != cached_device) {
+    check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "SM count");
+    cached_device = device;
+  }
   auto const needed = (n + kMarkBlock - 1) / kMarkBlock;
   return static_cast<unsigned>(std::max<std::int64_t>(1, std::min<std::int64_t>(needed, sms * 4)));
 }
@@ -121,6 +137,25 @@ void write_meta(rmm::device_buffer& meta,
     "meta upload");
   // `host` is a stack array; the copy must land before it goes away.
   check(cudaStreamSynchronize(stream.get()), "meta upload sync");
+}
+
+// Distinct values in a strided sample of `m` of the `n` elements, a lower bound on the column's.
+template <class T>
+std::int64_t sample_distinct(T const* data,
+                             std::int64_t n,
+                             std::int64_t m,
+                             rmm::exec_policy_nosync const& policy,
+                             ::cuda::stream_ref stream,
+                             rmm::device_async_resource_ref mr)
+{
+  rmm::device_buffer sample(m * sizeof(T), stream, mr);
+  auto* s           = static_cast<T*>(sample.data());
+  auto const stride = n / m;
+  auto const index =
+    thrust::make_transform_iterator(thrust::counting_iterator<std::int64_t>(0), strided{stride});
+  thrust::gather(policy, index, index + m, data, s);
+  thrust::sort(policy, s, s + m);
+  return static_cast<std::int64_t>(thrust::unique(policy, s, s + m) - s);
 }
 
 template <class T>
@@ -196,6 +231,10 @@ std::optional<dict_keys> build(T const* data,
     return out;
   }
 
+  if (n > kSampleFactor * max_keys &&
+      sample_distinct(data, n, kSampleFactor * max_keys, policy, stream, mr) > max_keys) {
+    return std::nullopt;
+  }
   rmm::device_buffer sorted(n * sizeof(T), stream, mr);
   auto* s = static_cast<T*>(sorted.data());
   thrust::copy(policy, data, data + n, s);

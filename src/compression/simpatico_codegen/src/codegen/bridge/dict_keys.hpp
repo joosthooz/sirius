@@ -6,6 +6,7 @@
 
 #include <cuda/stream_ref>
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -19,6 +20,13 @@ inline constexpr std::int64_t kDictLookupSearch = 1;
 // A key range up to this wide is indexed through a presence bitmap (2 MB at the limit) rather
 // than by binary search over the keys.
 inline constexpr std::uint64_t kDictMaxBitmapRange = std::uint64_t{1} << 24;
+
+// Whether codes for `num_keys` keys are at least two bits narrower than offsets over `span`
+// (max - min); short of that, a frame-of-reference bitpack stores the values about as narrowly.
+[[nodiscard]] inline bool dict_codes_pay(std::int64_t num_keys, std::uint64_t span)
+{
+  return std::bit_width(static_cast<std::uint64_t>(num_keys - 1)) + 2 <= std::bit_width(span);
+}
 
 // The sorted distinct values of a column and the lookup structures the fused Dict encoder reads
 // to map a value to its index among them. Field layout matches the kernel's input buffers.

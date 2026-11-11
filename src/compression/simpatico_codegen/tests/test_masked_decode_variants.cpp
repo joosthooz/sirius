@@ -888,6 +888,119 @@ bool run_delta_masked(const std::string& dtype, int arch)
   return true;
 }
 
+// A Dict root over bitpacked codes takes the generic seams: the masked
+// compacting decode stages the gathered keys and masked-stores them, and the
+// ballot compares them against the range. `keys` are sparse, so the
+// dictionary is worth building; `wide` spreads them past the bitmap range.
+template <typename Element>
+bool run_dict_masked(const std::string& dtype, bool wide, int arch)
+{
+  const std::int64_t n  = 4 * kChunk + 333;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+  const char* label = wide ? "search" : "bitmap";
+
+  std::vector<Element> keys;
+  for (std::int64_t k = 0; k < 40; ++k)
+    keys.push_back(static_cast<Element>((k - 20) * (wide ? 50'000'011 : 9'973)));
+  std::vector<Element> data(static_cast<std::size_t>(n));
+  for (std::int64_t i = 0; i < n; ++i) {
+    std::uint64_t s = 0xD1C7ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(i + 1));
+    // Chunk 2 holds one key (a zero-width code chunk).
+    data[static_cast<std::size_t>(i)] =
+      keys[(i / kChunk == 2) ? 7 : static_cast<std::size_t>(splitmix64(s) % keys.size())];
+  }
+
+  auto tree =
+    jit::FusedTree::make(OpKind::Dict, {{"codes", jit::FusedTree::make(OpKind::Bitpack)}});
+  GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
+  if (!compact_packed_on_host(enc, nc, /*node_id=*/1)) return false;
+
+  CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
+  REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree>(
+                stream, *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain)),
+              "[dict/%s/%s] plain launch failed",
+              dtype.c_str(),
+              label);
+  std::vector<Element> plain(static_cast<std::size_t>(n));
+  cudaMemcpy(plain.data(),
+             reinterpret_cast<const void*>(d_plain),
+             plain.size() * sizeof(Element),
+             cudaMemcpyDeviceToHost);
+  REQUIRE_MSG(plain == data, "[dict/%s/%s] plain decode != original input", dtype.c_str(), label);
+
+  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0xD1C7, 4100, /*zero_chunk=*/3);
+  std::vector<std::uint32_t> chunk_offsets;
+  const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
+  selection_mask sm;
+  sm.words    = reinterpret_cast<std::uint32_t*>(enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows = n;
+  sm.chunk_offsets = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+  sm.survivor_count = survivors;
+  CUdeviceptr d_out =
+    enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
+  REQUIRE_MSG(
+    completed_decode<simpatico::launch_decode_fused_tree_compacted>(stream,
+                                                                    *tree,
+                                                                    enc.buffers,
+                                                                    dtype.c_str(),
+                                                                    n,
+                                                                    sm,
+                                                                    simpatico::row_enumeration{},
+                                                                    reinterpret_cast<void*>(d_out)),
+    "[dict/%s/%s] masked decode launch failed",
+    dtype.c_str(),
+    label);
+  std::vector<Element> got(static_cast<std::size_t>(survivors));
+  if (survivors > 0) {
+    cudaMemcpy(got.data(),
+               reinterpret_cast<const void*>(d_out),
+               got.size() * sizeof(Element),
+               cudaMemcpyDeviceToHost);
+  }
+  REQUIRE_MSG(got == host_filter(data, mask),
+              "[dict/%s/%s] masked decode != host filter (%lld survivors)",
+              dtype.c_str(),
+              label,
+              static_cast<long long>(survivors));
+
+  const range_predicate preds[] = {
+    {static_cast<std::int64_t>(keys[10]), static_cast<std::int64_t>(keys[25])},
+    {static_cast<std::int64_t>(keys[0]), static_cast<std::int64_t>(keys[39])},
+    {static_cast<std::int64_t>(keys[3]) + 1, static_cast<std::int64_t>(keys[4]) - 1},
+  };
+  const char* names[]      = {"mid", "all", "none"};
+  const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
+  for (int p = 0; p < 3; ++p) {
+    CUdeviceptr d_mask = enc.alloc(nwords * 4);
+    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
+    selection_mask out_mask;
+    out_mask.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    out_mask.num_rows = n;
+    REQUIRE_MSG(completed_decode<simpatico::launch_decode_fused_tree_mask_out>(
+                  stream, *tree, enc.buffers, dtype.c_str(), n, preds[p], out_mask),
+                "[dict-ballot/%s/%s/%s] mask_out launch failed",
+                dtype.c_str(),
+                label,
+                names[p]);
+    std::vector<std::uint32_t> got_mask(nwords);
+    cudaMemcpy(
+      got_mask.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(got_mask == host_mask(data, nc, preds[p]),
+                "[dict-ballot/%s/%s/%s] ballot mask != host reference",
+                dtype.c_str(),
+                label,
+                names[p]);
+  }
+  std::printf("PASS: dict/%s/%s (survivors=%lld of %lld)\n",
+              dtype.c_str(),
+              label,
+              static_cast<long long>(survivors),
+              static_cast<long long>(n));
+  return true;
+}
+
 // the dictionary gather: masked constant-width dictionary gather.  Codes are
 // bitpacked int32 with small constant-width keys; the kernel must copy
 // exactly the survivors' key bytes, compacted, in row order.
@@ -1684,6 +1797,9 @@ int main()
     // The delta mask walk and the dictionary gather.
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);
+    run_dict_masked<std::int64_t>("int64_t", /*wide=*/false, arch);
+    run_dict_masked<std::int64_t>("int64_t", /*wide=*/true, arch);
+    run_dict_masked<std::int32_t>("int32_t", /*wide=*/false, arch);
     run_dict_gather(/*key_width=*/1, arch);
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
     // The str_split gather (shallow and deep offsets chains).
