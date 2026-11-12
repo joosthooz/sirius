@@ -138,6 +138,21 @@ So a plan chosen purely for ratio can cost row-skipping. `input -> identity` is 
 choice for a column nothing filters on (see above), but on a column the workload filters on, a
 bitpack-rooted plan additionally buys the mask walk.
 
+`dict` versus `bitpack` for a fixed-width column: both evaluate ranges while decoding (the `dict`
+ballot runs at bitpack's speed), so the choice comes down to ratio and decode cost. Measured
+against bitpack with a per-chunk common divisor folded out alongside the minimum, on the TPC-H
+numerics, dates and prices `dict` gains at most ~1% ratio while encoding 1.3–2x slower and
+decoding as fast or up to 20% slower; it declines columns with too many distinct values (`l_extendedprice`,
+`o_totalprice`, `c_acctbal`). Converting the SF1000 pins (`l_quantity`, `l_discount`, `l_tax`,
+`l_shipdate`) to `dict` made q1, q6, q12 and q14 6–8% slower. Reach for `dict` on a scattered
+low-cardinality column that bitpack cannot narrow — a few distinct values spread over a wide
+range — which none of the TPC-H pins are.
+
+The same measurement for `l_shipmode`: `dictionary` compresses 21.6x against `str_split`'s 1.4x,
+but q12 and q19 already get their equality filter pushed down with `str_split`, and the
+`dictionary` plan's decode of the survivors is slower (q12 +15%, q19 +7%). Choose `dictionary`
+for it only where pinned memory, not time, is the constraint.
+
 Selectivity governs whether compaction is attempted at all, because compacting is only cheaper
 than decoding when enough rows are dropped:
 
