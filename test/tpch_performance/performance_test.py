@@ -934,6 +934,20 @@ def _flush_between_runs(con, profile, use_gpu, source, data_source):
         con.execute("CALL reset_sirius_cache();").fetchall()
 
 
+def _set_parquet_metadata_cache(con, enabled, s3_input):
+    """Cache parsed Parquet footers only for pinned, non-first iterations.
+
+    Re-parsing a table's footers at every bind costs a few milliseconds per
+    query. Iteration 0 is the cold run and keeps the setting off, so it never
+    reuses footers an earlier query parsed on the same connection. Local files
+    only: a remote object can change under a cached footer.
+    """
+    if s3_input is None:
+        _execute_multi(
+            con, f"SET parquet_metadata_cache = {'true' if enabled else 'false'};"
+        )
+
+
 def run_grouped(
     source,
     queries,
@@ -994,6 +1008,8 @@ def run_grouped(
                                 ),
                             )
                             pinned = True
+                        if pinned:
+                            _set_parquet_metadata_cache(con, it > 0, s3_input)
                         log(f"--- q{qnum} iter{it} engine={name} ---")
                         if drop_scope == "run":
                             _flush_between_runs(
@@ -1015,6 +1031,7 @@ def run_grouped(
                     if pinned:
                         log(f"  Unpinning tables for q{qnum}")
                         _execute_multi(con, emit_unpin(qnum))
+                        _set_parquet_metadata_cache(con, False, s3_input)
         finally:
             log("Closing connection")
             con.close()
@@ -1074,6 +1091,8 @@ def run_sequential(
                             ),
                         )
                         pinned = True
+                    if pinned:
+                        _set_parquet_metadata_cache(con, it > 0, s3_input)
                     if drop_scope == "iteration":
                         log(f"--- iter{it} flush engine={name} ---")
                         _flush_between_runs(con, profile, use_gpu, source, data_source)
@@ -1099,6 +1118,7 @@ def run_sequential(
                 if pinned:
                     log("  Union-unpinning all TPC-H tables")
                     _execute_multi(con, emit_unpin_all())
+                    _set_parquet_metadata_cache(con, False, s3_input)
         finally:
             log("Closing connection")
             con.close()
