@@ -22,6 +22,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/detail/error.hpp>
@@ -38,8 +39,9 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <cassert>
+#include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace sirius {
@@ -72,17 +74,31 @@ bool column_has_data_buffer(const cudf::column_view& col) noexcept
   }
 }
 
+/// True if @p col or any of its children starts at a non-zero row offset, i.e. views a slice.
+bool has_row_offset(const cudf::column_view& col) noexcept
+{
+  if (col.offset() != 0) { return true; }
+  for (cudf::size_type i = 0; i < col.num_children(); ++i) {
+    if (has_row_offset(col.child(i))) { return true; }
+  }
+  return false;
+}
+
 /**
  * @brief Recursively plan the buffer layout for one column, filling in column_metadata.
  *
- * @note Assumes the column view has offset == 0 (i.e. the table is not a slice) — same contract
- * as the builtin converter this replaces.
+ * Every buffer is copied from its first byte, so the column must not be a slice: the caller
+ * compacts sliced views first.
+ *
+ * @throws cucascade::logic_error if @p col has a non-zero offset
  */
 cucascade::memory::column_metadata plan_column_copy(const cudf::column_view& col,
                                                     std::size_t& current_offset,
                                                     ::cuda::stream_ref stream)
 {
-  assert(col.offset() == 0 && "column_view with non-zero offset is not supported");
+  if (col.offset() != 0) {
+    CUCASCADE_FAIL("chunked spill: column_view with non-zero offset is not supported");
+  }
 
   cucascade::memory::column_metadata meta{};
   meta.type_id    = static_cast<int32_t>(col.type().id());
@@ -264,7 +280,17 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
 
   auto const& gpu_source = source.cast<cucascade::gpu_table_representation>();
   gpu_source.wait_for_writer(stream);
-  const cudf::table_view view = gpu_source.get_table_view();
+  cudf::table_view view = gpu_source.get_table_view();
+
+  // A view-backed batch may cover a row range of a larger table. Its buffers do not start at its
+  // first row, so it is compacted into a table of its own before planning. The copy is temporary
+  // GPU memory, freed once the D2H copies below have completed.
+  std::unique_ptr<cudf::table> compacted;
+  if (std::any_of(view.begin(), view.end(), has_row_offset)) {
+    compacted = std::make_unique<cudf::table>(
+      view, stream, gpu_source.get_memory_space().get_default_allocator());
+    view = compacted->view();
+  }
 
   // Pass 1: plan the allocation layout.
   std::size_t current_offset = 0;

@@ -16,7 +16,21 @@
 
 #include "catch.hpp"
 #include "data/chunked_spill_copy.hpp"
+#include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "data/spill_chunked_converters.hpp"
+#include "operator/operator_test_utils.hpp"
+
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/unary.hpp>
+
+#include <rmm/cuda_stream.hpp>
 
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -25,6 +39,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <numeric>
 #include <vector>
 
@@ -184,4 +199,80 @@ TEST_CASE("register_chunked_spill_converters with 0 keeps the builtin converter"
   REQUIRE(
     registry
       .has_converter<cucascade::gpu_table_representation, cucascade::host_data_representation>());
+}
+
+TEST_CASE("chunked spill of a sliced view round-trips the slice's rows", "[chunked_spill_copy]")
+{
+  sirius::test::operator_utils::ensure_converter_registry();
+  static auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space      = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* host_space     = manager->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  auto const& registry = sirius::converter_registry::get();
+  rmm::cuda_stream owned_stream;
+  auto const stream = owned_stream.view();
+
+  // Rows 0..999 as BIGINT, rows [100, 140) NULL, plus the same values as strings.
+  constexpr cudf::size_type num_rows = 1000;
+  cudf::numeric_scalar<int64_t> const zero{0, true, stream};
+  auto ints = cudf::sequence(num_rows, zero, stream);
+  auto mask = cudf::create_null_mask(num_rows, cudf::mask_state::ALL_VALID, stream);
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 100, 140, false, stream);
+  auto strings = cudf::strings::from_integers(ints->view(), stream);
+  ints->set_null_mask(std::move(mask), 40);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(ints));
+  columns.push_back(std::move(strings));
+  auto parent = std::make_shared<cudf::table>(std::move(columns));
+
+  // An offset that is neither element- nor bitmask-word-aligned in bytes.
+  constexpr cudf::size_type begin = 37;
+  constexpr cudf::size_type end   = 637;
+  auto const slice                = cudf::slice(parent->view(), {begin, end}, stream)[0];
+  auto batch                      = sirius::make_data_batch_from_view(slice,
+                                                 parent,
+                                                 parent->alloc_size(),
+                                                 *gpu_space,
+                                                 stream,
+                                                 sirius::telemetry::batch_telemetry_info{});
+
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
+    REQUIRE(mut.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
+  }
+  auto ro             = batch->to_read_only();
+  auto const restored = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto const num_slice_rows = static_cast<std::size_t>(end - begin);
+  REQUIRE(restored.num_rows() == end - begin);
+
+  auto const download = [&](cudf::column_view const& col) {
+    std::vector<int64_t> out(num_slice_rows);
+    REQUIRE(cudaMemcpyAsync(out.data(),
+                            col.data<int64_t>(),
+                            num_slice_rows * sizeof(int64_t),
+                            cudaMemcpyDeviceToHost,
+                            stream.value()) == cudaSuccess);
+    return out;
+  };
+  auto const values        = download(restored.column(0));
+  auto const parsed_column = cudf::strings::to_integers(
+    cudf::strings_column_view{restored.column(1)}, cudf::data_type{cudf::type_id::INT64}, stream);
+  auto const parsed = download(parsed_column->view());
+  auto const nulls  = cudf::is_null(restored.column(0), stream);
+  std::vector<uint8_t> is_null(num_slice_rows);
+  REQUIRE(cudaMemcpyAsync(is_null.data(),
+                          nulls->view().data<bool>(),
+                          num_slice_rows,
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+
+  for (std::size_t i = 0; i < num_slice_rows; ++i) {
+    auto const row = static_cast<int64_t>(begin) + static_cast<int64_t>(i);
+    INFO("row " << row);
+    REQUIRE(parsed[i] == row);
+    REQUIRE(static_cast<bool>(is_null[i]) == (row >= 100 && row < 140));
+    if (!is_null[i]) { REQUIRE(values[i] == row); }
+  }
 }
