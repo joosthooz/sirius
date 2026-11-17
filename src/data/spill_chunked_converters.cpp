@@ -17,6 +17,7 @@
 #include "data/spill_chunked_converters.hpp"
 
 #include "data/chunked_spill_copy.hpp"
+#include "data/sliced_view_guards.hpp"
 #include "log/logging.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -39,7 +40,6 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -72,16 +72,6 @@ bool column_has_data_buffer(const cudf::column_view& col) noexcept
     case cudf::type_id::EMPTY: return false;
     default: return true;
   }
-}
-
-/// True if @p col or any of its children starts at a non-zero row offset, i.e. views a slice.
-bool has_row_offset(const cudf::column_view& col) noexcept
-{
-  if (col.offset() != 0) { return true; }
-  for (cudf::size_type i = 0; i < col.num_children(); ++i) {
-    if (has_row_offset(col.child(i))) { return true; }
-  }
-  return false;
 }
 
 /**
@@ -286,7 +276,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   // first row, so it is compacted into a table of its own before planning. The copy is temporary
   // GPU memory, freed once the D2H copies below have completed.
   std::unique_ptr<cudf::table> compacted;
-  if (std::any_of(view.begin(), view.end(), has_row_offset)) {
+  if (has_row_offset(view)) {
     compacted = std::make_unique<cudf::table>(
       view, stream, gpu_source.get_memory_space().get_default_allocator());
     view = compacted->view();

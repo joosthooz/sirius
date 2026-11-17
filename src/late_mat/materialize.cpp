@@ -157,6 +157,10 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
   host_starts.reserve(column.batches.size());
   if (any_nullable) { host_masks.reserve(column.batches.size()); }
   for (std::size_t b = 0; b < column.batches.size(); ++b) {
+    // The gather kernel indexes each batch's data and mask from row 0 of its buffers.
+    if (column.batches[b].uncompressed.offset() != 0) {
+      throw std::runtime_error("late_mat::materialize: sliced origin columns are not supported");
+    }
     host_bases.push_back(column.batches[b].uncompressed.head<void>());
     host_starts.push_back(selection.layout().batch_row_start[b]);
     if (any_nullable) { host_masks.push_back(column.batches[b].uncompressed.null_mask()); }

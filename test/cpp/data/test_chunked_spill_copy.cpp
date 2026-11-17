@@ -18,6 +18,7 @@
 #include "data/chunked_spill_copy.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "data/sliced_view_guards.hpp"
 #include "data/spill_chunked_converters.hpp"
 #include "operator/operator_test_utils.hpp"
 
@@ -36,6 +37,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -201,78 +203,160 @@ TEST_CASE("register_chunked_spill_converters with 0 keeps the builtin converter"
       .has_converter<cucascade::gpu_table_representation, cucascade::host_data_representation>());
 }
 
-TEST_CASE("chunked spill of a sliced view round-trips the slice's rows", "[chunked_spill_copy]")
+namespace {
+
+struct spill_env {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager =
+    sirius::test::operator_utils::initialize_memory_manager();
+  cucascade::memory::memory_space* gpu_space =
+    manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  cucascade::memory::memory_space* host_space =
+    manager->get_memory_space(cucascade::memory::Tier::HOST, 0);
+};
+
+spill_env& env()
 {
   sirius::test::operator_utils::ensure_converter_registry();
-  static auto manager  = sirius::test::operator_utils::initialize_memory_manager();
-  auto* gpu_space      = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  auto* host_space     = manager->get_memory_space(cucascade::memory::Tier::HOST, 0);
-  auto const& registry = sirius::converter_registry::get();
-  rmm::cuda_stream owned_stream;
-  auto const stream = owned_stream.view();
+  static spill_env e;
+  return e;
+}
 
-  // Rows 0..999 as BIGINT, rows [100, 140) NULL, plus the same values as strings.
-  constexpr cudf::size_type num_rows = 1000;
+constexpr cudf::size_type kParentRows = 1000;
+constexpr cudf::size_type kNullBegin  = 100;
+constexpr cudf::size_type kNullEnd    = 140;
+
+/// A view batch of rows [@p begin, @p end) of a table holding rows 0..999 as BIGINT, rows
+/// [100, 140) NULL, plus the same values as strings.
+std::shared_ptr<cucascade::data_batch> make_sliced_batch(cudf::size_type begin,
+                                                         cudf::size_type end,
+                                                         rmm::cuda_stream_view stream)
+{
   cudf::numeric_scalar<int64_t> const zero{0, true, stream};
-  auto ints = cudf::sequence(num_rows, zero, stream);
-  auto mask = cudf::create_null_mask(num_rows, cudf::mask_state::ALL_VALID, stream);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 100, 140, false, stream);
+  auto ints = cudf::sequence(kParentRows, zero, stream);
+  auto mask = cudf::create_null_mask(kParentRows, cudf::mask_state::ALL_VALID, stream);
+  cudf::set_null_mask(
+    static_cast<cudf::bitmask_type*>(mask.data()), kNullBegin, kNullEnd, false, stream);
   auto strings = cudf::strings::from_integers(ints->view(), stream);
-  ints->set_null_mask(std::move(mask), 40);
+  ints->set_null_mask(std::move(mask), kNullEnd - kNullBegin);
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(ints));
   columns.push_back(std::move(strings));
   auto parent = std::make_shared<cudf::table>(std::move(columns));
 
-  // An offset that is neither element- nor bitmask-word-aligned in bytes.
-  constexpr cudf::size_type begin = 37;
-  constexpr cudf::size_type end   = 637;
-  auto const slice                = cudf::slice(parent->view(), {begin, end}, stream)[0];
-  auto batch                      = sirius::make_data_batch_from_view(slice,
-                                                 parent,
-                                                 parent->alloc_size(),
-                                                 *gpu_space,
-                                                 stream,
-                                                 sirius::telemetry::batch_telemetry_info{});
+  auto const slice = cudf::slice(parent->view(), {begin, end}, stream)[0];
+  return sirius::make_data_batch_from_view(slice,
+                                           parent,
+                                           parent->alloc_size(),
+                                           *env().gpu_space,
+                                           stream,
+                                           sirius::telemetry::batch_telemetry_info{});
+}
 
-  {
-    auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
-    REQUIRE(mut.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
-  }
-  auto ro             = batch->to_read_only();
-  auto const restored = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
-  auto const num_slice_rows = static_cast<std::size_t>(end - begin);
-  REQUIRE(restored.num_rows() == end - begin);
+/// Require that @p batch, on the GPU, holds exactly rows [@p begin, @p end) of the parent.
+void require_slice_rows(cucascade::data_batch& batch,
+                        cudf::size_type begin,
+                        cudf::size_type end,
+                        rmm::cuda_stream_view stream)
+{
+  auto ro         = batch.to_read_only();
+  auto const view = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto const rows = static_cast<std::size_t>(end - begin);
+  REQUIRE(view.num_rows() == end - begin);
 
   auto const download = [&](cudf::column_view const& col) {
-    std::vector<int64_t> out(num_slice_rows);
+    std::vector<int64_t> out(rows);
     REQUIRE(cudaMemcpyAsync(out.data(),
                             col.data<int64_t>(),
-                            num_slice_rows * sizeof(int64_t),
+                            rows * sizeof(int64_t),
                             cudaMemcpyDeviceToHost,
                             stream.value()) == cudaSuccess);
     return out;
   };
-  auto const values        = download(restored.column(0));
+  auto const values        = download(view.column(0));
   auto const parsed_column = cudf::strings::to_integers(
-    cudf::strings_column_view{restored.column(1)}, cudf::data_type{cudf::type_id::INT64}, stream);
+    cudf::strings_column_view{view.column(1)}, cudf::data_type{cudf::type_id::INT64}, stream);
   auto const parsed = download(parsed_column->view());
-  auto const nulls  = cudf::is_null(restored.column(0), stream);
-  std::vector<uint8_t> is_null(num_slice_rows);
-  REQUIRE(cudaMemcpyAsync(is_null.data(),
-                          nulls->view().data<bool>(),
-                          num_slice_rows,
-                          cudaMemcpyDeviceToHost,
-                          stream.value()) == cudaSuccess);
+  auto const nulls  = cudf::is_null(view.column(0), stream);
+  std::vector<uint8_t> is_null(rows);
+  REQUIRE(
+    cudaMemcpyAsync(
+      is_null.data(), nulls->view().data<bool>(), rows, cudaMemcpyDeviceToHost, stream.value()) ==
+    cudaSuccess);
   stream.synchronize();
 
-  for (std::size_t i = 0; i < num_slice_rows; ++i) {
+  for (std::size_t i = 0; i < rows; ++i) {
     auto const row = static_cast<int64_t>(begin) + static_cast<int64_t>(i);
     INFO("row " << row);
     REQUIRE(parsed[i] == row);
-    REQUIRE(static_cast<bool>(is_null[i]) == (row >= 100 && row < 140));
+    REQUIRE(static_cast<bool>(is_null[i]) == (row >= kNullBegin && row < kNullEnd));
     if (!is_null[i]) { REQUIRE(values[i] == row); }
+  }
+}
+
+// An offset that is neither element- nor bitmask-word-aligned in bytes.
+constexpr cudf::size_type kSliceBegin = 37;
+constexpr cudf::size_type kSliceEnd   = 637;
+
+}  // namespace
+
+TEST_CASE("chunked spill of a sliced view round-trips the slice's rows", "[chunked_spill_copy]")
+{
+  rmm::cuda_stream owned_stream;
+  auto const stream = owned_stream.view();
+  auto batch        = make_sliced_batch(kSliceBegin, kSliceEnd, stream);
+  // After env(): setting up the memory manager may replace the registry instance.
+  auto const& registry = sirius::converter_registry::get();
+  {
+    auto mut = batch->to_mutable();
+    mut.convert_to<cucascade::host_data_representation>(registry, env().host_space, stream);
+    REQUIRE(mut.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+    mut.convert_to<cucascade::gpu_table_representation>(registry, env().gpu_space, stream);
+  }
+  require_slice_rows(*batch, kSliceBegin, kSliceEnd, stream);
+}
+
+TEST_CASE("guarded builtin converters refuse a sliced GPU table", "[chunked_spill_copy]")
+{
+  rmm::cuda_stream owned_stream;
+  auto const stream = owned_stream.view();
+  // The builtins plus their guards, without the chunked converter that replaces the GPU->HOST
+  // guard in the Sirius registry.
+  cucascade::representation_converter_registry registry;
+  cucascade::register_builtin_converters(registry);
+  sirius::register_sliced_view_guards(registry);
+
+  SECTION("a slice that does not start at row 0 throws and stays on the GPU")
+  {
+    auto batch = make_sliced_batch(kSliceBegin, kSliceEnd, stream);
+    {
+      auto mut = batch->to_mutable();
+      REQUIRE_THROWS_AS(
+        mut.convert_to<cucascade::host_data_representation>(registry, env().host_space, stream),
+        cucascade::logic_error);
+      REQUIRE(mut.get_memory_space()->get_tier() == cucascade::memory::Tier::GPU);
+    }
+    require_slice_rows(*batch, kSliceBegin, kSliceEnd, stream);
+  }
+
+  SECTION("an unsliced table converts")
+  {
+    auto batch = make_sliced_batch(0, kParentRows, stream);
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::host_data_representation>(registry, env().host_space, stream);
+      REQUIRE(mut.get_memory_space()->get_tier() == cucascade::memory::Tier::HOST);
+      mut.convert_to<cucascade::gpu_table_representation>(registry, env().gpu_space, stream);
+    }
+    require_slice_rows(*batch, 0, kParentRows, stream);
+  }
+
+  SECTION("a same-device GPU->GPU conversion of a slice is a compacting clone")
+  {
+    auto batch = make_sliced_batch(kSliceBegin, kSliceEnd, stream);
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(registry, env().gpu_space, stream);
+    }
+    require_slice_rows(*batch, kSliceBegin, kSliceEnd, stream);
   }
 }
