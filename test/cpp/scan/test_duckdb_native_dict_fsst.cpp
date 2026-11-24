@@ -158,6 +158,40 @@ staged_segments stage(std::vector<segment> const& segments,
   return staged;
 }
 
+// Check every row of the STRING column @p decoded against the CPU's values from row @p start.
+void check_strings(cudf::column const& decoded,
+                   std::vector<std::optional<std::string>> const& expected,
+                   uint64_t start,
+                   rmm::cuda_stream& stream)
+{
+  cudf::strings_column_view strings(decoded.view());
+  auto const count = static_cast<uint32_t>(decoded.size());
+  auto offsets     = sirius::test::decode::download<int32_t>(
+    strings.offsets().data<int32_t>(), count + 1, stream.value());
+  std::vector<uint8_t> chars;
+  if (strings.chars_size(stream) != 0) {
+    chars = sirius::test::decode::download<uint8_t>(
+      strings.chars_begin(stream), strings.chars_size(stream), stream.value());
+  }
+  std::vector<cudf::bitmask_type> mask;
+  if (decoded.nullable()) {
+    mask = sirius::test::decode::download<cudf::bitmask_type>(
+      decoded.view().null_mask(), (count + 31) / 32, stream.value());
+  }
+  for (uint32_t row = 0; row < count; ++row) {
+    CAPTURE(row);
+    auto const& value = expected[start + row];
+    bool const valid  = mask.empty() || ((mask[row / 32] >> (row % 32)) & 1u);
+    REQUIRE(valid == value.has_value());
+    if (!valid) { continue; }
+    auto actual = offsets[row] == offsets[row + 1]
+                    ? std::string{}
+                    : std::string(reinterpret_cast<char const*>(chars.data() + offsets[row]),
+                                  offsets[row + 1] - offsets[row]);
+    REQUIRE(actual == *value);
+  }
+}
+
 // Decode @p segments to a DICTIONARY32 column and check every row against the CPU's value, and
 // that the keys are exactly the distinct non-null values.
 void check_dictionary_decode(std::vector<segment> const& segments,
@@ -181,32 +215,8 @@ void check_dictionary_decode(std::vector<segment> const& segments,
   REQUIRE(dictionary.keys_size() == static_cast<cudf::size_type>(distinct.size()));
 
   auto decoded = cudf::dictionary::decode(dictionary, stream, mr);
-  cudf::strings_column_view strings(decoded->view());
-  auto const count = static_cast<uint32_t>(column->size());
-  auto offsets     = sirius::test::decode::download<int32_t>(
-    strings.offsets().data<int32_t>(), count + 1, stream.value());
-  std::vector<uint8_t> chars;
-  if (strings.chars_size(stream) != 0) {
-    chars = sirius::test::decode::download<uint8_t>(
-      strings.chars_begin(stream), strings.chars_size(stream), stream.value());
-  }
-  std::vector<cudf::bitmask_type> mask;
-  if (decoded->nullable()) {
-    mask = sirius::test::decode::download<cudf::bitmask_type>(
-      decoded->view().null_mask(), (count + 31) / 32, stream.value());
-  }
-  for (uint32_t row = 0; row < count; ++row) {
-    CAPTURE(row, run_per_segment);
-    auto const& value = expected[segments.front().start + row];
-    bool const valid  = mask.empty() || ((mask[row / 32] >> (row % 32)) & 1u);
-    REQUIRE(valid == value.has_value());
-    if (!valid) { continue; }
-    auto actual = offsets[row] == offsets[row + 1]
-                    ? std::string{}
-                    : std::string(reinterpret_cast<char const*>(chars.data() + offsets[row]),
-                                  offsets[row + 1] - offsets[row]);
-    REQUIRE(actual == *value);
-  }
+  CAPTURE(run_per_segment);
+  check_strings(*decoded, expected, segments.front().start, stream);
 }
 
 void verify_dictionary_shape(size_t shape_index, bool multiple_segments = false)
@@ -346,15 +356,20 @@ TEST_CASE("DuckDB-written DICT_FSST merges segment dictionaries into one key set
   verify_dictionary_shape(6, true);
 }
 
-TEST_CASE("DuckDB-written DICT_FSST without a dictionary declines the DICTIONARY32 decode",
+TEST_CASE("DuckDB-written DICT_FSST without a dictionary decodes to strings instead",
           "[integration][scan][decode][strings][dict_fsst][dictionary_carrier]")
 {
   fixture disk;
   disk.create(candidate_shapes().at(2));
   auto const segments = disk.read_segments();
   REQUIRE_FALSE(segments.empty());
+  auto const expected = disk.cpu_rows();
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  auto staged = stage(segments, disk.cpu_rows(), false, stream);
-  REQUIRE_FALSE(sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr));
+  auto staged = stage(segments, expected, false, stream);
+  auto column = sirius::cuda::scan::gpu_decode_strings_dictionary_column(staged.input, stream, mr);
+  REQUIRE(column);
+  REQUIRE(column->type().id() == cudf::type_id::STRING);
+  REQUIRE(column->size() == static_cast<cudf::size_type>(staged.input.total_rows));
+  check_strings(*column, expected, segments.front().start, stream);
 }

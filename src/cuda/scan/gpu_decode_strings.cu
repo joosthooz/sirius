@@ -61,6 +61,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -97,14 +98,36 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, ::cuda::str
   }
 }
 
-}  // namespace
+/// Appends one run's prepared DICT_FSST state, rebasing its descriptors onto the merged arrays.
+void append_dict_fsst(prepared_dict_fsst& merged, prepared_dict_fsst run)
+{
+  auto const slot_base      = static_cast<uint32_t>(merged.byte_offsets.size());
+  auto const decoder_base   = static_cast<uint32_t>(merged.decoders.size());
+  auto const predecode_base = merged.total_predecode_bytes;
+  for (auto& d : run.descs) {
+    d.seg_dict_offset_base += slot_base;
+    d.seg_decoder_idx += decoder_base;
+    if (d.mode == DICT_FSST_MODE_DICT_FSST) { d.predecode_seg_offset += predecode_base; }
+  }
+  merged.byte_offsets.insert(
+    merged.byte_offsets.end(), run.byte_offsets.begin(), run.byte_offsets.end());
+  merged.decoded_offsets.insert(
+    merged.decoded_offsets.end(), run.decoded_offsets.begin(), run.decoded_offsets.end());
+  merged.decoders.insert(merged.decoders.end(), run.decoders.begin(), run.decoders.end());
+  merged.descs.insert(merged.descs.end(), run.descs.begin(), run.descs.end());
+  merged.any_inline_nulls = merged.any_inline_nulls || run.any_inline_nulls;
+  merged.total_predecode_bytes += run.total_predecode_bytes;
+}
 
 /// Decodes one VARCHAR column via the shared two-phase flow (see file banner):
 /// aggregate per-codec prepared state, write per-row lengths, scan to offsets,
-/// gather bytes, then build the cudf strings column.
-std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
-                                                        ::cuda::stream_ref stream,
-                                                        rmm::device_async_resource_ref mr)
+/// gather bytes, then build the cudf strings column. @p prepared_dict_fsst_runs, when set, holds
+/// every DICT_FSST run already prepared and merged, so those runs are not prepared again.
+std::unique_ptr<cudf::column> decode_strings_column(
+  gpu_string_column_decode_input const& col,
+  std::optional<prepared_dict_fsst> prepared_dict_fsst_runs,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
 {
   uint32_t const total_rows = col.total_rows;
   if (total_rows == 0) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}); }
@@ -119,8 +142,9 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   prepared_dict_fsst prep_dict_fsst;
   prep_dict_fsst.any_inline_nulls      = false;
   prep_dict_fsst.total_predecode_bytes = 0;
-  size_t cum_chars_upper               = 0;
-  bool needs_exact_total               = false;
+  if (prepared_dict_fsst_runs) { prep_dict_fsst = std::move(*prepared_dict_fsst_runs); }
+  size_t cum_chars_upper = 0;
+  bool needs_exact_total = false;
   for (auto const& run : col.data) {
     switch (run.codec) {
       case duckdb::CompressionType::COMPRESSION_DICTIONARY: {
@@ -154,24 +178,9 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         break;
       }
       case duckdb::CompressionType::COMPRESSION_DICT_FSST: {
-        auto p                    = prepare_dict_fsst(run, stream, mr);
-        auto const bo_base        = static_cast<uint32_t>(prep_dict_fsst.byte_offsets.size());
-        auto const dec_base       = static_cast<uint32_t>(prep_dict_fsst.decoders.size());
-        auto const predecode_base = prep_dict_fsst.total_predecode_bytes;
-        for (auto& d : p.descs) {
-          d.seg_dict_offset_base += bo_base;
-          d.seg_decoder_idx += dec_base;
-          if (d.mode == DICT_FSST_MODE_DICT_FSST) { d.predecode_seg_offset += predecode_base; }
+        if (!prepared_dict_fsst_runs) {
+          append_dict_fsst(prep_dict_fsst, prepare_dict_fsst(run, stream, mr));
         }
-        prep_dict_fsst.byte_offsets.insert(
-          prep_dict_fsst.byte_offsets.end(), p.byte_offsets.begin(), p.byte_offsets.end());
-        prep_dict_fsst.decoded_offsets.insert(
-          prep_dict_fsst.decoded_offsets.end(), p.decoded_offsets.begin(), p.decoded_offsets.end());
-        prep_dict_fsst.decoders.insert(
-          prep_dict_fsst.decoders.end(), p.decoders.begin(), p.decoders.end());
-        prep_dict_fsst.descs.insert(prep_dict_fsst.descs.end(), p.descs.begin(), p.descs.end());
-        prep_dict_fsst.any_inline_nulls = prep_dict_fsst.any_inline_nulls || p.any_inline_nulls;
-        prep_dict_fsst.total_predecode_bytes += p.total_predecode_bytes;
         break;
       }
       case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED: {
@@ -407,6 +416,15 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                                    std::move(null_mask));
 }
 
+}  // namespace
+
+std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
+                                                        ::cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  return decode_strings_column(col, std::nullopt, stream, mr);
+}
+
 std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
   gpu_string_column_decode_input const& col,
   ::cuda::stream_ref stream,
@@ -428,28 +446,16 @@ std::unique_ptr<cudf::column> gpu_decode_strings_dictionary_column(
   prep.any_inline_nulls      = false;
   prep.total_predecode_bytes = 0;
   for (auto const& run : col.data) {
-    auto p                    = prepare_dict_fsst(run, stream, mr);
-    auto const slot_base      = static_cast<uint32_t>(prep.byte_offsets.size());
-    auto const decoder_base   = static_cast<uint32_t>(prep.decoders.size());
-    auto const predecode_base = prep.total_predecode_bytes;
-    for (auto& d : p.descs) {
-      if (d.mode == DICT_FSST_MODE_FSST_ONLY) { return nullptr; }
-      d.seg_dict_offset_base += slot_base;
-      d.seg_decoder_idx += decoder_base;
-      if (d.mode == DICT_FSST_MODE_DICT_FSST) { d.predecode_seg_offset += predecode_base; }
-    }
-    prep.byte_offsets.insert(prep.byte_offsets.end(), p.byte_offsets.begin(), p.byte_offsets.end());
-    prep.decoded_offsets.insert(
-      prep.decoded_offsets.end(), p.decoded_offsets.begin(), p.decoded_offsets.end());
-    prep.decoders.insert(prep.decoders.end(), p.decoders.begin(), p.decoders.end());
-    prep.descs.insert(prep.descs.end(), p.descs.begin(), p.descs.end());
-    prep.any_inline_nulls = prep.any_inline_nulls || p.any_inline_nulls;
-    prep.total_predecode_bytes += p.total_predecode_bytes;
+    append_dict_fsst(prep, prepare_dict_fsst(run, stream, mr));
   }
+  // Preparing already read the headers and built the offsets, so a column with no usable
+  // dictionary decodes to strings from that state instead of preparing again.
   auto const total_slots = prep.byte_offsets.size();
   if (prep.descs.empty() || total_slots == 0 ||
-      total_slots > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
-    return nullptr;
+      total_slots > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()) ||
+      std::ranges::any_of(
+        prep.descs, [](dict_fsst_desc const& d) { return d.mode == DICT_FSST_MODE_FSST_ONLY; })) {
+    return decode_strings_column(col, std::move(prep), stream, mr);
   }
 
   auto upload = [&](void const* src, size_t bytes) {

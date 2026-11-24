@@ -182,8 +182,12 @@ TEST_CASE_METHOD(DictionaryCarrierFixture,
                  "[integration][gpu_execution][dictionary_carrier]")
 {
   CHECK(carried_dictionaries("SELECT low, count(*) FROM " + parquet + " GROUP BY low") == 1);
-  CHECK(carried_dictionaries("SELECT low, distinct_values FROM " + parquet) == 1);
+  CHECK(carried_dictionaries("SELECT low, x FROM " + parquet) == 1);
   CHECK(carried_dictionaries("SELECT low, nullable, \"group\" FROM " + parquet) == 3);
+  // cuDF would return the plainly stored `distinct_values` as a dictionary too, hash-encoding it.
+  CHECK(carried_dictionaries("SELECT low, distinct_values FROM " + parquet) == 0);
+  CHECK(carried_dictionaries("SELECT low, max(distinct_values) FROM " + parquet +
+                             " GROUP BY low") == 0);
   // The reader's row filter would turn off cuDF's dictionary transcode.
   CHECK(carried_dictionaries("SELECT low, count(*) FROM " + parquet +
                              " WHERE x > 10 GROUP BY low") == 0);

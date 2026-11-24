@@ -348,15 +348,6 @@ TEST_CASE_METHOD(ParquetFilesFixture,
         std::optional<std::size_t>{100});
 }
 
-namespace {
-
-bool contains(std::vector<std::string> const& names, std::string const& name)
-{
-  return std::ranges::find(names, name) != names.end();
-}
-
-}  // namespace
-
 TEST_CASE_METHOD(ParquetFilesFixture,
                  "parquet footer statistics - dictionary columns are the strings every row group "
                  "dictionary-encodes",
@@ -400,26 +391,49 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   REQUIRE_FALSE(dictionary_in("mixed", false));
   REQUIRE_FALSE(dictionary_in("distinct_values", false));
 
-  auto const columns = [&](std::size_t max_bytes) {
+  auto const columns = [&] {
     auto const plan = con->ExtractPlan("SELECT * FROM read_parquet('" + file.string() + "')");
     auto const* get = first_get(*plan);
     REQUIRE(get != nullptr);
     run_ok("BEGIN TRANSACTION;");
-    auto names = parquet_dictionary_string_columns(*con->context, *get, max_bytes);
+    auto found = parquet_dictionary_string_columns(*con->context, *get);
     run_ok("ROLLBACK;");
-    return names;
+    return found;
   };
-  auto const found = columns(parquet_dictionary_carrier_max_bytes);
-  CHECK(contains(found, "low"));
-  CHECK_FALSE(contains(found, "mixed"));
-  CHECK_FALSE(contains(found, "distinct_values"));
-  CHECK_FALSE(contains(found, "x"));
-
-  CHECK(columns(1).empty());
+  auto const found = columns();
+  REQUIRE(found.contains("low"));
+  CHECK(found.at("low") > 0);
+  CHECK(found.at("low") <= parquet_dictionary_carrier_max_bytes);
+  CHECK_FALSE(found.contains("mixed"));
+  CHECK_FALSE(found.contains("distinct_values"));
+  CHECK_FALSE(found.contains("x"));
 
   // A rewritten file is probed again rather than answered from the cache.
   write("'u' || range");
-  CHECK_FALSE(contains(columns(parquet_dictionary_carrier_max_bytes), "low"));
+  CHECK_FALSE(columns().contains("low"));
+}
+
+TEST_CASE_METHOD(ParquetFilesFixture,
+                 "parquet footer statistics - dictionary columns are kept for a bounded number "
+                 "of files",
+                 "[integration][gpu_execution][transparent][parquet_footer_statistics]"
+                 "[dictionary_carrier]")
+{
+  using sirius::transparent::detail::dictionary_columns_cache_capacity;
+  using sirius::transparent::detail::dictionary_columns_cache_size;
+  for (std::size_t file = 0; file < dictionary_columns_cache_capacity + 8; ++file) {
+    auto const path = dir / ("strings" + std::to_string(file) + ".parquet");
+    run_ok("COPY (SELECT 'k' || (range % 10) AS low FROM range(100)) TO '" + path.string() +
+           "' (FORMAT parquet);");
+    auto const plan = con->ExtractPlan("SELECT * FROM read_parquet('" + path.string() + "')");
+    auto const* get = first_get(*plan);
+    REQUIRE(get != nullptr);
+    run_ok("BEGIN TRANSACTION;");
+    CHECK(
+      sirius::transparent::parquet_dictionary_string_columns(*con->context, *get).contains("low"));
+    run_ok("ROLLBACK;");
+  }
+  CHECK(dictionary_columns_cache_size() <= dictionary_columns_cache_capacity);
 }
 
 TEST_CASE_METHOD(ParquetFilesFixture,
@@ -433,9 +447,7 @@ TEST_CASE_METHOD(ParquetFilesFixture,
   auto const* get = first_get(*plan);
   REQUIRE(get != nullptr);
   run_ok("BEGIN TRANSACTION;");
-  CHECK(sirius::transparent::parquet_dictionary_string_columns(
-          *con->context, *get, sirius::transparent::parquet_dictionary_carrier_max_bytes)
-          .empty());
+  CHECK(sirius::transparent::parquet_dictionary_string_columns(*con->context, *get).empty());
   run_ok("ROLLBACK;");
   run_ok("DROP TABLE native_strings;");
 }

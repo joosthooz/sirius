@@ -374,10 +374,20 @@ std::unordered_set<std::size_t> source_dictionary_columns(
   // dictionary transcode; the scan would then hash-encode every batch, costing more than the
   // carrier saves downstream.
   if (op.table_filters.HasFilters() || op.table_filters.HasMultiColumnFilters()) { return result; }
-  auto const names = sirius::transparent::parquet_dictionary_string_columns(
-    context, op, sirius::transparent::parquet_dictionary_carrier_max_bytes);
-  for (std::size_t primary = 0; primary < op.names.size(); ++primary) {
-    if (std::ranges::find(names, op.names[primary].GetIdentifierName()) != names.end()) {
+  auto const dictionary_bytes = sirius::transparent::parquet_dictionary_string_columns(context, op);
+  for (auto const& id : ids) {
+    if (!id.HasPrimaryIndex() || id.IsVirtualColumn()) { continue; }
+    auto const primary = id.GetPrimaryIndex();
+    if (primary >= op.returned_types.size() || primary >= op.names.size() ||
+        op.returned_types[primary].id() != duckdb::LogicalTypeId::VARCHAR) {
+      continue;
+    }
+    // Asked for one dictionary, cuDF returns every flat string column as one, hash-encoding those
+    // it cannot transcode from dictionary pages. A projected string column stored plainly would pay
+    // that encode and the decode back, which can cost more than the carriers save.
+    auto const found = dictionary_bytes.find(op.names[primary].GetIdentifierName());
+    if (found == dictionary_bytes.end()) { return {}; }
+    if (found->second <= sirius::transparent::parquet_dictionary_carrier_max_bytes) {
       result.insert(primary);
     }
   }
